@@ -183,7 +183,7 @@ if [ "${1:-}" = "prepare" ]; then
     -e "RUSTUP_TOOLCHAIN=1.99.1-${TRIPLE}" \
     -e RUSTUP_SKIP_UPDATE_CHECK=1 \
     "$RUST_IMAGE" \
-    bash -c "export PATH=\"/usr/local/rustup/toolchains/1.99.1-${TRIPLE}/bin:\$PATH\"; cd /src/codex-rs && cargo fetch --locked"
+    bash -c "export PATH=\"/usr/local/rustup/toolchains/1.99.1-${TRIPLE}/bin:\$PATH\"; cd /src/codex-rs && /usr/local/rustup/toolchains/1.99.1-${TRIPLE}/bin/cargo fetch --locked"
   rm -rf "$PREP_SRC"
   trap - EXIT
   echo "prepare 完成（build 可完全离线）"
@@ -346,7 +346,7 @@ if [ "$MODE" = "local-cargo" ]; then
     -e "RUSTUP_TOOLCHAIN=1.99.1-${TRIPLE}" \
     -e RUSTUP_SKIP_UPDATE_CHECK=1 \
     "$RUST_IMAGE" \
-    bash -c "git config --global --add safe.directory /src >/dev/null 2>&1 || true; actual=\$(uname -m); [ \"\$actual\" = \"\$CTD_EXPECTED_UNAME\" ] || { echo \"FAIL: builder uname=\$actual expected=\$CTD_EXPECTED_UNAME\"; exit 1; }; export PATH=\"/usr/local/rustup/toolchains/1.99.1-${TRIPLE}/bin:\$PATH\"; cd /src/codex-rs && cargo build --release --locked --offline -p codex-transportd"
+    bash -c "git config --global --add safe.directory /src >/dev/null 2>&1 || true; actual=\$(uname -m); [ \"\$actual\" = \"\$CTD_EXPECTED_UNAME\" ] || { echo \"FAIL: builder uname=\$actual expected=\$CTD_EXPECTED_UNAME\"; exit 1; }; export PATH=\"/usr/local/rustup/toolchains/1.99.1-${TRIPLE}/bin:\$PATH\"; cd /src/codex-rs && /usr/local/rustup/toolchains/1.99.1-${TRIPLE}/bin/cargo build --release --locked --offline -p codex-transportd"
   ELF="$TARGET_DIR/release/codex-transportd"
   [ -f "$ELF" ] || { echo "FAIL: ELF 未产出"; exit 1; }
   CTX="$WORK_DIR/ctx"
