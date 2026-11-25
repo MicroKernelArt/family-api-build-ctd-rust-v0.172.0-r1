@@ -174,12 +174,13 @@ if [ "${1:-}" = "prepare" ]; then
   trap 'rm -rf "$PREP_SRC"' EXIT
   git clone --quiet "$REPO" "$PREP_SRC"
   git -C "$PREP_SRC" checkout --quiet "$SRC_COMMIT"
+  rm -f "$PREP_SRC/codex-rs/rust-toolchain.toml"
   echo "   cargo fetch --locked（source=${SRC_COMMIT}）"
   docker run --rm --pull=never --platform "$PLATFORM" \
     -v "$PREP_SRC":/src:ro \
     -v "$HOME/.cargo/git":/usr/local/cargo/git \
     -v "$HOME/.cargo/registry":/usr/local/cargo/registry \
-    -e RUSTUP_TOOLCHAIN=stable \
+    -e "RUSTUP_TOOLCHAIN=1.99.1-${TRIPLE}" \
     -e RUSTUP_SKIP_UPDATE_CHECK=1 \
     "$RUST_IMAGE" \
     bash -c "export PATH=\"/usr/local/rustup/toolchains/1.99.1-${TRIPLE}/bin:\$PATH\"; cd /src/codex-rs && cargo fetch --locked"
@@ -316,6 +317,7 @@ PY
 [ -n "$EXPECT_UPSTREAM_VERSION" ] || { echo "FAIL: 无法从 codex-rs/Cargo.toml 推导 workspace version"; exit 1; }
 EXPECT_RUST_TOOLCHAIN="$(sed -n 's/^channel = "\(.*\)"/\1/p' "$SRC/codex-rs/rust-toolchain.toml")"
 [ -n "$EXPECT_RUST_TOOLCHAIN" ] || { echo "FAIL: 无法从 codex-rs/rust-toolchain.toml 推导 channel"; exit 1; }
+rm -f "$SRC/codex-rs/rust-toolchain.toml"
 # 运行阶段的 FROM（Dockerfile 里最后一个 FROM，即不带 AS 的运行镜像）。
 EXPECT_BASE_IMAGE_REF="$(sed -n 's/^FROM[[:space:]]\+\([^[:space:]]*\).*/\1/p' "$SRC/codex-rs/codex-transportd/Dockerfile" | tail -1)"
 [ -n "$EXPECT_BASE_IMAGE_REF" ] || { echo "FAIL: 无法从 Dockerfile 运行阶段推导 base image ref"; exit 1; }
@@ -341,7 +343,7 @@ if [ "$MODE" = "local-cargo" ]; then
     -e CTD_EXPECTED_UNAME="$EXPECTED_UNAME" \
     -e "RUSTY_V8_ARCHIVE=/v8-cache/${V8_NAME}" \
     -e "RUSTY_V8_SRC_BINDING_PATH=/v8-cache/${V8_BINDING_NAME}" \
-    -e RUSTUP_TOOLCHAIN=stable \
+    -e "RUSTUP_TOOLCHAIN=1.99.1-${TRIPLE}" \
     -e RUSTUP_SKIP_UPDATE_CHECK=1 \
     "$RUST_IMAGE" \
     bash -c "git config --global --add safe.directory /src >/dev/null 2>&1 || true; actual=\$(uname -m); [ \"\$actual\" = \"\$CTD_EXPECTED_UNAME\" ] || { echo \"FAIL: builder uname=\$actual expected=\$CTD_EXPECTED_UNAME\"; exit 1; }; export PATH=\"/usr/local/rustup/toolchains/1.99.1-${TRIPLE}/bin:\$PATH\"; cd /src/codex-rs && cargo build --release --locked --offline -p codex-transportd"
