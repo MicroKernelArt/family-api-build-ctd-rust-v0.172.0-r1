@@ -1,0 +1,27 @@
+name: gen-lock-0172
+
+on:
+  workflow_dispatch:
+
+jobs:
+  gen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Generate lock from source commit
+        run: |
+          set -euo pipefail
+          C1="$(sed -n 's/^source_commit: //p' patches/transportd/series.yaml | tr -d ' ')"
+          test -n "$C1"
+          git checkout "$C1"
+          cd codex-rs
+          cargo +1.99.1 generate-lockfile
+          cp Cargo.lock "$RUNNER_TEMP/Cargo.lock"
+          sha256sum "$RUNNER_TEMP/Cargo.lock"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cargo-lock-0172
+          path: ${{ runner.temp }}/Cargo.lock
