@@ -1,0 +1,155 @@
+From 2caf4663511c6755eb7bbce94909060ce137497e Mon Sep 17 00:00:00 2001
+From: Shanks <shanks@book>
+Date: Thu, 15 Oct 2026 15:33:21 +0800
+Subject: [PATCH 36/37] feat(transportd): make request body limit
+ runtime-configurable
+
+Replace the compile-time MAX_BODY_BYTES const with a runtime-resolved limit
+read from CODEX_TRANSPORTD_MAX_BODY_MB (MiB). Defaults to 8 MiB when the
+variable is unset, empty, non-numeric, or zero. Invalid values fall back to
+the default instead of failing startup.
+
+Rationale: allow adjusting the request-body ceiling without rebuilding the
+sidecar image; the previous const required a full Rust rebuild.
+
+- limits.rs: MAX_BODY_BYTES_DEFAULT / MAX_BODY_BYTES_ENV / parse_max_body_bytes /
+  max_body_bytes (LazyLock cache)
+- server/mod.rs + server/http.rs: use limits::max_body_bytes()
+- tests: fallback, honor, saturation, cache consistency
+---
+ codex-rs/codex-transportd/src/limits.rs      | 73 +++++++++++++++++++-
+ codex-rs/codex-transportd/src/server/http.rs |  2 +-
+ codex-rs/codex-transportd/src/server/mod.rs  |  2 +-
+ 3 files changed, 72 insertions(+), 5 deletions(-)
+
+diff --git a/codex-rs/codex-transportd/src/limits.rs b/codex-rs/codex-transportd/src/limits.rs
+index 70e25adfb..8e4329e22 100644
+--- a/codex-rs/codex-transportd/src/limits.rs
++++ b/codex-rs/codex-transportd/src/limits.rs
+@@ -1,6 +1,10 @@
+ //! 资源上限（TLS-CTD-001 §6.3 / FR-021 / INV-013）。
+ //!
+ //! 所有 buffer/queue/pool/并发均有静态上限；禁止无界 channel。
++//!
++//! 例外：请求体上限 [`max_body_bytes()`] 支持运行时通过环境变量
++//! [`MAX_BODY_BYTES_ENV`] 调整（默认 [`MAX_BODY_BYTES_DEFAULT`]），
++//! 以便无需重新编译即可放宽限制。
+ 
+ /// 全局并发 in-flight 请求上限。
+ pub const MAX_INFLIGHT: usize = 64;
+@@ -11,8 +15,38 @@ pub const MAX_UDS_CONNECTIONS: usize = 128;
+ /// WS 并发连接上限（1:1）。
+ pub const MAX_WS_CONNECTIONS: usize = 32;
+ 
+-/// 请求体上限（与 Go 侧限制保持一致）。
+-pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
++/// 请求体上限默认值（8 MiB）。
++///
++/// 与 Go 侧（sub2api）的 `server.max_body_mb` 默认值对齐。
++pub const MAX_BODY_BYTES_DEFAULT: usize = 8 * 1024 * 1024;
++
++/// 请求体上限的环境变量名（单位：MiB）。
++pub const MAX_BODY_BYTES_ENV: &str = "CODEX_TRANSPORTD_MAX_BODY_MB";
++
++/// 解析请求体上限（纯函数，便于测试）。
++///
++/// - `None` / 空串 / 非法数字 / `0` → 回落 [`MAX_BODY_BYTES_DEFAULT`]
++/// - 合法正整数 `N` → `N` MiB（饱和乘法，防溢出）
++pub fn parse_max_body_bytes(raw: Option<&str>) -> usize {
++    raw.map(str::trim)
++        .filter(|s| !s.is_empty())
++        .and_then(|s| s.parse::<usize>().ok())
++        .filter(|&mb| mb > 0)
++        .map(|mb| mb.saturating_mul(1024 * 1024))
++        .unwrap_or(MAX_BODY_BYTES_DEFAULT)
++}
++
++/// 运行时的请求体上限（进程内缓存一次）。
++///
++/// 读取环境变量 [`MAX_BODY_BYTES_ENV`]；修改该变量需要重启进程才能生效。
++static MAX_BODY_BYTES: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
++    parse_max_body_bytes(std::env::var(MAX_BODY_BYTES_ENV).ok().as_deref())
++});
++
++/// 返回运行时的请求体上限（字节）。
++pub fn max_body_bytes() -> usize {
++    *MAX_BODY_BYTES
++}
+ 
+ /// 请求 header 总字节上限。
+ pub const MAX_HEADER_BYTES: usize = 64 * 1024;
+@@ -51,11 +85,44 @@ mod tests {
+         const _: () = assert!(MAX_INFLIGHT > 0);
+         const _: () = assert!(MAX_UDS_CONNECTIONS > 0);
+         const _: () = assert!(MAX_WS_CONNECTIONS > 0);
+-        const _: () = assert!(MAX_BODY_BYTES > 0);
++        const _: () = assert!(MAX_BODY_BYTES_DEFAULT > 0);
+         const _: () = assert!(MAX_HEADER_BYTES > 0);
+         const _: () = assert!(MAX_HEADER_COUNT > 0);
+         const _: () = assert!(CLIENT_POOL_MAX_ENTRIES > 0);
+         const _: () = assert!(CHUNK_SIZE > 0);
+         const _: () = assert!(WS_FRAME_QUEUE_CAPACITY > 0);
+     }
++
++    #[test]
++    fn parse_max_body_bytes_falls_back_to_default() {
++        // 未设 / 空串 / 非法 / 0 都回落默认 8 MiB。
++        assert_eq!(parse_max_body_bytes(None), MAX_BODY_BYTES_DEFAULT);
++        assert_eq!(parse_max_body_bytes(Some("")), MAX_BODY_BYTES_DEFAULT);
++        assert_eq!(parse_max_body_bytes(Some("   ")), MAX_BODY_BYTES_DEFAULT);
++        assert_eq!(parse_max_body_bytes(Some("abc")), MAX_BODY_BYTES_DEFAULT);
++        assert_eq!(parse_max_body_bytes(Some("-1")), MAX_BODY_BYTES_DEFAULT);
++        assert_eq!(parse_max_body_bytes(Some("0")), MAX_BODY_BYTES_DEFAULT);
++        assert_eq!(parse_max_body_bytes(Some("8.5")), MAX_BODY_BYTES_DEFAULT);
++    }
++
++    #[test]
++    fn parse_max_body_bytes_honors_value() {
++        assert_eq!(parse_max_body_bytes(Some("1")), 1024 * 1024);
++        assert_eq!(parse_max_body_bytes(Some("16")), 16 * 1024 * 1024);
++        assert_eq!(parse_max_body_bytes(Some(" 32 ")), 32 * 1024 * 1024);
++    }
++
++    #[test]
++    fn parse_max_body_bytes_saturates_on_overflow() {
++        // 极大值不得 panic，饱和到 usize::MAX。
++        assert_eq!(parse_max_body_bytes(Some(&usize::MAX.to_string())), usize::MAX);
++    }
++
++    #[test]
++    fn max_body_bytes_is_positive_and_cached() {
++        let a = max_body_bytes();
++        let b = max_body_bytes();
++        assert!(a > 0);
++        assert_eq!(a, b, "缓存后两次调用必须一致");
++    }
+ }
+diff --git a/codex-rs/codex-transportd/src/server/http.rs b/codex-rs/codex-transportd/src/server/http.rs
+index d5516fe97..3d4f58e11 100644
+--- a/codex-rs/codex-transportd/src/server/http.rs
++++ b/codex-rs/codex-transportd/src/server/http.rs
+@@ -56,7 +56,7 @@ pub(crate) async fn handle_http_operation(
+             "unknown",
+         );
+     }
+-    if body.len() > limits::MAX_BODY_BYTES {
++    if body.len() > limits::max_body_bytes() {
+         return local_error_response(&crate::contract::error::codes::body_too_large(), "unknown");
+     }
+ 
+diff --git a/codex-rs/codex-transportd/src/server/mod.rs b/codex-rs/codex-transportd/src/server/mod.rs
+index 53ebbfb28..ceda640cb 100644
+--- a/codex-rs/codex-transportd/src/server/mod.rs
++++ b/codex-rs/codex-transportd/src/server/mod.rs
+@@ -228,7 +228,7 @@ fn router() -> Router<Arc<ServerState>> {
+         )
+         // F-012（round-3）：DefaultBodyLimit 必须在所有 .route() 之后添加，
+         // 否则只包裹空 router、后续路由仍受 axum 默认 2 MiB 限制。
+-        .layer(axum::extract::DefaultBodyLimit::max(limits::MAX_BODY_BYTES))
++        .layer(axum::extract::DefaultBodyLimit::max(limits::max_body_bytes()))
+ }
+ 
+ /// 根据 operation 执行对应原始请求，返回 X-CTD-Origin 标注的响应。
+-- 
+2.48.1
+

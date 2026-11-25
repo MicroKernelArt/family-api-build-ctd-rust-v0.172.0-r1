@@ -1,0 +1,416 @@
+From 24f863ad061e951c0825495e7194f75aa06344e2 Mon Sep 17 00:00:00 2001
+From: Shanks <shanks@book>
+Date: Thu, 1 Oct 2026 12:12:16 +0800
+Subject: [PATCH 19/37] feat(transportd): carry whitelisted official headers
+ into the upstream projection
+
+R-CTD (rust_sidecar) previously rebuilt every upstream request from a blank
+HeaderMap, so the official `x-codex-*` metadata that the Go gateway had
+already scoped per account never reached the upstream. R-Go (native direct)
+does send them, so the two transports diverged.
+
+Add the single sanctioned header channel to the cross-language contract:
+`X-CTD-Carried-Headers` carries a JSON object<string,string> whose keys must
+be in CARRIED_HEADER_NAMES (verbatim equal to the Go-side
+codexCarriedHeaderNames). Credential keys (authorization /
+chatgpt-account-id / cookie) fail closed at parse time; non-whitelisted keys
+are dropped, so the carrier can never degenerate into a raw header map.
+
+Injection points:
+- responses HTTP/SSE: union with the local official projection (carried wins);
+- compact: same channel;
+- responses body: `client_metadata["x-codex-turn-metadata"]` is restored from
+  the carried value, because the snapshot-derived projection always reports
+  has_turn_metadata() == false and Go strips the client's reserved copy.
+
+WS handshake intentionally not injected: the official WS handshake header set
+is protocol-owned and never carries turn-metadata as a header
+(core/tests/suite/client_websockets.rs).
+
+Local required headers (host/content-length/accept/content-type) and the
+official auth pair (authorization / chatgpt-account-id) are still written by
+the official client and BearerAuthProvider.
+
+Verified: cargo check -p codex-transportd --all-targets; cargo test
+-p codex-transportd --lib (149 passed).
+
+(cherry picked from commit ee93455495e3bc9f63aca478efff22b3353fc68b)
+---
+ .../codex-transportd/src/contract/headers.rs  | 222 ++++++++++++++++++
+ .../codex-transportd/src/transport/compact.rs |   2 +
+ .../src/transport/metadata.rs                 |  34 +++
+ .../src/transport/responses.rs                |  10 +
+ .../src/transport/websocket.rs                |   6 +
+ 5 files changed, 274 insertions(+)
+
+diff --git a/codex-rs/codex-transportd/src/contract/headers.rs b/codex-rs/codex-transportd/src/contract/headers.rs
+index 42bf688f8..bdce58e5d 100644
+--- a/codex-rs/codex-transportd/src/contract/headers.rs
++++ b/codex-rs/codex-transportd/src/contract/headers.rs
+@@ -3,7 +3,13 @@
+ //! 所有 `X-CTD-*` header 在入口解析后即被消费并丢弃；Rust 从空白
+ //! `HeaderMap` 经官方 builder 构造 upstream 请求，禁止
+ //! `headers.extend(internal_request.headers())`。
++//!
++//! 唯一例外是受控白名单通道 [`CARRIED_HEADERS_HEADER`]：Go 侧已按账号身份
++//! scope 完成的官方 `x-codex-*` 元数据以 JSON 承载，解析后只保留
++//! [`CARRIED_HEADER_NAMES`] 内的键（凭据键 fail closed），注入时值原样写入
++//! 上游投影——它不是"整块 header 继承"，而是逐键白名单。
+ 
++use std::collections::BTreeMap;
+ use std::time::Instant;
+ 
+ use http::HeaderMap;
+@@ -46,6 +52,35 @@ pub const ATTACHMENT_ID_HEADER: &str = "x-ctd-attachment-id";
+ /// capture 白名单身份（capture-r1；仅 UDS，Go 从认证后的 API Key 注入；
+ /// 只允许 capture 模块消费，禁止加入任何上游投影）。
+ pub const USER_ID_HEADER: &str = "x-ctd-user-id";
++/// 白名单出站头承载（FR-004 唯一 header 通道；Go 侧
++/// `codex_transport_sidecar.go` 写入，单个 header 承载 JSON object<string,string>）。
++/// 编码契约（两端逐字一致）：UTF-8 JSON object，键为小写官方 header 名，
++/// 值为 Go 侧已按账号身份 scope 完成的最终出站值。
++pub const CARRIED_HEADERS_HEADER: &str = "x-ctd-carried-headers";
++
++/// 允许承载到上游投影的官方 header 白名单（小写）。
++/// 与 Go 侧 `codex_transport_integration.go` 的 `codexCarriedHeaderNames`
++/// **逐字相等**；任何一侧增删都会让上游投影与 R-Go 直连发生漂移。
++///
++/// 有意不纳入：`user-agent` / `originator` / `version`（跨语言契约显式禁止携带，
++/// 由官方 client 信封产出）、`x-codex-installation-id`（installation 身份由
++/// sidecar 从 account_key 确定性派生）、`x-codex-parent-thread-id` /
++/// `x-openai-subagent`（subagent 作用域，不在 R-Go 对拍范围）。
++pub const CARRIED_HEADER_NAMES: &[&str] = &[
++    "session-id",
++    "thread-id",
++    "x-codex-window-id",
++    "x-codex-turn-metadata",
++    "x-codex-beta-features",
++    "x-codex-routing-hint",
++    "x-openai-internal-codex-responses-lite",
++    "x-client-request-id",
++    "openai-beta",
++];
++
++/// 凭据硬护栏：这些名字绝不进入上游投影，出现即 fail closed
++/// （与 Go 侧 `codexCarriedHeaderDenylist` 逐字相等）。
++pub const CARRIED_HEADER_DENYLIST: &[&str] = &["authorization", "chatgpt-account-id", "cookie"];
+ 
+ /// 请求目的（仅低基数观测，不成为 upstream header/body 字段）。
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+@@ -102,6 +137,10 @@ pub struct RequestContext {
+     pub attachment_id: Option<String>,
+     /// capture 白名单身份（capture-r1；缺省 None，不 fail；仅 capture 模块消费）。
+     pub user_id: Option<String>,
++    /// 白名单出站头承载（FR-004）：Go 侧已 scope 完成的官方 x-codex-* 元数据。
++    /// 解析时只保留 [`CARRIED_HEADER_NAMES`]，凭据键 fail closed；注入端原样
++    /// 写入上游投影（覆盖 sidecar 本地投影）。
++    pub carried_headers: BTreeMap<String, String>,
+     /// 内部 traceparent（只建立 Go→Rust child span；不得复制到 upstream）。
+     pub traceparent: Option<String>,
+ }
+@@ -364,12 +403,89 @@ pub fn parse_request_context(
+             .filter(|v| !v.is_empty())
+             .map(String::from),
+         user_id: header_str(headers, USER_ID_HEADER).map(String::from),
++        carried_headers: parse_carried_headers(header_str(headers, CARRIED_HEADERS_HEADER))?,
+         traceparent: header_str(headers, "traceparent")
+             .filter(|v| !v.is_empty())
+             .map(ToString::to_string),
+     })
+ }
+ 
++/// 解析并校验白名单承载头（[`CARRIED_HEADERS_HEADER`]）。
++///
++/// 编码契约与 Go 侧 `codex_transport_sidecar.go::encodeCodexCarriedHeaders`
++/// 逐字一致：UTF-8 JSON object<string,string>，键为小写官方 header 名。
++///
++/// 解析规则（fail closed）：
++/// - 缺失/空白 → 空 map（不承载，等价于旧行为）；
++/// - 非法 JSON / 非 object<string,string> / 非法 header 名或值 → typed
++///   contract error（在任何 upstream I/O 之前）；
++/// - 凭据键（[`CARRIED_HEADER_DENYLIST`]）→ typed contract error；
++/// - 白名单外的键 → 丢弃（结构上不可能进入上游投影）。
++fn parse_carried_headers(raw: Option<&str>) -> Result<BTreeMap<String, String>, LocalError> {
++    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
++        return Ok(BTreeMap::new());
++    };
++    let decoded: BTreeMap<String, String> = serde_json::from_str(raw).map_err(|_| {
++        LocalError::new(
++            "invalid_carried_headers",
++            ErrorClass::Contract,
++            ErrorPhase::Validate,
++            false,
++            "X-CTD-Carried-Headers 不是合法的 JSON object<string,string>",
++        )
++    })?;
++    let mut carried = BTreeMap::new();
++    for (name, value) in decoded {
++        let name = name.trim().to_ascii_lowercase();
++        if CARRIED_HEADER_DENYLIST.contains(&name.as_str()) {
++            // 只报 header 名，绝不回显值（值可能是凭据）。
++            return Err(LocalError::new(
++                "carried_headers_credential_rejected",
++                ErrorClass::Contract,
++                ErrorPhase::Validate,
++                false,
++                format!("承载头禁止携带凭据头 {name}"),
++            ));
++        }
++        if !CARRIED_HEADER_NAMES.contains(&name.as_str()) || value.is_empty() {
++            continue;
++        }
++        if http::header::HeaderName::from_bytes(name.as_bytes()).is_err()
++            || HeaderValue::from_str(&value).is_err()
++        {
++            return Err(LocalError::new(
++                "invalid_carried_headers",
++                ErrorClass::Contract,
++                ErrorPhase::Validate,
++                false,
++                format!("承载头 {name} 的名字或值不是合法 HTTP header"),
++            ));
++        }
++        carried.insert(name, value);
++    }
++    Ok(carried)
++}
++
++impl RequestContext {
++    /// 承载头 → 上游投影 `HeaderMap`（仅白名单，值原样注入）。
++    ///
++    /// 解析期已完成名字/值合法性校验，因此这里只做逐键搬运，不做任何
++    /// 归一化/重编码（保持与 R-Go 直连逐字节一致）。
++    pub fn carried_header_map(&self) -> HeaderMap {
++        let mut headers = HeaderMap::new();
++        for (name, value) in &self.carried_headers {
++            let Ok(name) = http::header::HeaderName::from_bytes(name.as_bytes()) else {
++                continue;
++            };
++            let Ok(value) = HeaderValue::from_str(value) else {
++                continue;
++            };
++            headers.insert(name, value);
++        }
++        headers
++    }
++}
++
+ fn now_ms() -> u64 {
+     std::time::SystemTime::now()
+         .duration_since(std::time::UNIX_EPOCH)
+@@ -561,6 +677,112 @@ mod p1_header_tests {
+     }
+ }
+ 
++#[cfg(test)]
++mod carried_header_tests {
++    use super::*;
++    use crate::contract::operation::Operation;
++
++    fn base() -> HeaderMap {
++        let mut headers = http::HeaderMap::new();
++        headers.insert(PROTOCOL_VERSION_HEADER, HeaderValue::from_static("1"));
++        headers.insert(REQUEST_ID_HEADER, HeaderValue::from_static("req_carried"));
++        headers.insert(ACCOUNT_KEY_HEADER, HeaderValue::from_static("ak-1"));
++        headers.insert(CREDENTIAL_REVISION_HEADER, HeaderValue::from_static("rev-1"));
++        headers.insert(ACCESS_TOKEN_HEADER, HeaderValue::from_static("sk-secret"));
++        headers.insert(PROXY_KIND_HEADER, HeaderValue::from_static("direct"));
++        headers.insert(
++            SESSION_ID_HEADER,
++            HeaderValue::from_static("0198f2b0-0000-7000-8000-000000000001"),
++        );
++        headers.insert(
++            THREAD_ID_HEADER,
++            HeaderValue::from_static("0198f2b0-0000-7000-8000-000000000002"),
++        );
++        headers.insert(
++            WINDOW_ID_HEADER,
++            HeaderValue::from_static("0198f2b0-0000-7000-8000-000000000002:1"),
++        );
++        headers
++    }
++
++    fn with_carried(raw: &str) -> Result<RequestContext, LocalError> {
++        let mut headers = base();
++        headers.insert(
++            CARRIED_HEADERS_HEADER,
++            HeaderValue::from_str(raw).expect("header value"),
++        );
++        parse_request_context(&headers, Operation::Responses)
++    }
++
++    #[test]
++    fn absent_carrier_is_empty_and_never_fails() {
++        // 旧版 Go（无承载通道）必须继续可用：缺省 = 空 map，不 fail。
++        let ctx = parse_request_context(&base(), Operation::Responses).expect("parse");
++        assert!(ctx.carried_headers.is_empty());
++        assert!(ctx.carried_header_map().is_empty());
++    }
++
++    #[test]
++    fn whitelisted_values_are_carried_and_injected_verbatim() {
++        let raw = r#"{"x-codex-turn-metadata":"{\"sandbox\":\"seatbelt\",\"model\":\"gpt-5\"}","x-client-request-id":"req-abc","openai-beta":"responses_multi_agent=2026-01-01"}"#;
++        let ctx = with_carried(raw).expect("parse");
++        assert_eq!(ctx.carried_headers.len(), 3);
++        let outbound = ctx.carried_header_map();
++        assert_eq!(
++            outbound.get("x-codex-turn-metadata").expect("turn metadata"),
++            r#"{"sandbox":"seatbelt","model":"gpt-5"}"#
++        );
++        assert_eq!(outbound.get("x-client-request-id").unwrap(), "req-abc");
++        assert_eq!(
++            outbound.get("openai-beta").unwrap(),
++            "responses_multi_agent=2026-01-01"
++        );
++    }
++
++    #[test]
++    fn credentials_are_never_carried() {
++        // 硬护栏：authorization / chatgpt-account-id / cookie 出现即 fail closed
++        // （不静默丢弃，避免掩盖上游身份注入缺陷）。
++        for denied in CARRIED_HEADER_DENYLIST {
++            let raw = format!(r#"{{"{denied}":"secret-value"}}"#);
++            let err = with_carried(&raw).expect_err("credential must be rejected");
++            assert_eq!(err.code, "carried_headers_credential_rejected");
++            assert!(
++                !format!("{err:?}").contains("secret-value"),
++                "凭据值绝不出现在错误正文"
++            );
++        }
++    }
++
++    #[test]
++    fn non_whitelisted_headers_are_dropped() {
++        let raw = r#"{"x-codex-installation-id":"inst-1","user-agent":"codex-tui/0.159.0","x-codex-window-id":"0198f2b0-0000-7000-8000-000000000002:1"}"#;
++        let ctx = with_carried(raw).expect("parse");
++        assert_eq!(ctx.carried_headers.len(), 1);
++        assert_eq!(
++            ctx.carried_headers.get("x-codex-window-id").map(String::as_str),
++            Some("0198f2b0-0000-7000-8000-000000000002:1")
++        );
++        let outbound = ctx.carried_header_map();
++        assert!(outbound.get("x-codex-installation-id").is_none());
++        assert!(outbound.get("user-agent").is_none());
++    }
++
++    #[test]
++    fn malformed_carrier_is_contract_error() {
++        for raw in ["not-json", "[]", r#"{"x-client-request-id":1}"#] {
++            let err = with_carried(raw).expect_err("malformed");
++            assert_eq!(err.code, "invalid_carried_headers");
++        }
++    }
++
++    #[test]
++    fn blank_carrier_is_empty() {
++        let ctx = with_carried("   ").expect("parse");
++        assert!(ctx.carried_headers.is_empty());
++    }
++}
++
+ #[cfg(test)]
+ mod deadline_tests {
+     use super::*;
+diff --git a/codex-rs/codex-transportd/src/transport/compact.rs b/codex-rs/codex-transportd/src/transport/compact.rs
+index 6358f124b..338604f0c 100644
+--- a/codex-rs/codex-transportd/src/transport/compact.rs
++++ b/codex-rs/codex-transportd/src/transport/compact.rs
+@@ -66,6 +66,8 @@ pub async fn execute_compact_raw(
+     let mut headers = responses::installation_header(installation_id);
+     headers.extend(responses::session_headers(ctx));
+     headers.extend(responses::compatibility_headers(&projection));
++    // 承载头（FR-004）：与 responses 路径同一通道，保证 compact 与 R-Go 直连一致。
++    headers.extend(ctx.carried_header_map());
+ 
+     // capture 旁路（capture-r1）：请求体校验通过后、发上游前入队；
+     // 上游失败早退时句柄 Drop → 诚实 .resp.err 终态。
+diff --git a/codex-rs/codex-transportd/src/transport/metadata.rs b/codex-rs/codex-transportd/src/transport/metadata.rs
+index b610877e7..e0c9a6bf2 100644
+--- a/codex-rs/codex-transportd/src/transport/metadata.rs
++++ b/codex-rs/codex-transportd/src/transport/metadata.rs
+@@ -205,6 +205,40 @@ pub fn inject_official_client_metadata(
+     obj.insert("client_metadata".to_string(), Value::Object(merged));
+ }
+ 
++/// `x-codex-turn-metadata` 在 body 中的 canonical 键名
++/// （官方 `client_metadata()` 用它写入 body；compatibility header 只是投影）。
++pub const TURN_METADATA_CLIENT_METADATA_KEY: &str = "x-codex-turn-metadata";
++
++/// 把承载的 `x-codex-turn-metadata` 补进 body 的 canonical 位。
++///
++/// 官方客户端 HTTP 同时写两处：body `client_metadata["x-codex-turn-metadata"]`
++/// （canonical）与 compatibility header。sidecar 的 projection 只由 session
++/// snapshot 合成，`has_turn_metadata()` 恒为 false；Go 侧 reserved 剥离又会删掉
++/// 客户端原始值 ⇒ 这一位只有承载通道能补，否则 rust_sidecar 的 body 比 R-Go
++/// 直连少一个 canonical 字段。
++///
++/// 值按字符串原样写入（官方投影同样是 JSON 字符串），已存在时不覆盖。
++/// 已知近似：承载的是 **header** 值；若客户端 header 与 body 两处取值不一致，
++/// rust_sidecar 采用 header 值（R-Go 采用 body 值）。
++pub fn inject_carried_turn_metadata(
++    obj: &mut Map<String, Value>,
++    carried: &std::collections::BTreeMap<String, String>,
++) {
++    let Some(raw) = carried.get(TURN_METADATA_CLIENT_METADATA_KEY) else {
++        return;
++    };
++    let Some(Value::Object(metadata)) = obj.get_mut("client_metadata") else {
++        return;
++    };
++    if metadata.contains_key(TURN_METADATA_CLIENT_METADATA_KEY) {
++        return;
++    }
++    metadata.insert(
++        TURN_METADATA_CLIENT_METADATA_KEY.to_string(),
++        Value::String(raw.clone()),
++    );
++}
++
+ /// 构造官方 metadata 投影（UUIDv7 校验在入口完成）。
+ pub fn build_projection(
+     installation_id: &str,
+diff --git a/codex-rs/codex-transportd/src/transport/responses.rs b/codex-rs/codex-transportd/src/transport/responses.rs
+index 2259f1e8b..6c7f77dd3 100644
+--- a/codex-rs/codex-transportd/src/transport/responses.rs
++++ b/codex-rs/codex-transportd/src/transport/responses.rs
+@@ -110,10 +110,20 @@ pub async fn execute_responses_raw(
+         extra,
+         projection.client_metadata(/*include_internal*/ true),
+     );
++    // canonical 位对齐：官方 HTTP 把 turn-metadata 同时放在 body client_metadata
++    // 与 compatibility header；projection 由 snapshot 合成拿不到该值，用承载值补。
++    metadata::inject_carried_turn_metadata(&mut obj, &ctx.carried_headers);
+ 
+     // 3. extra headers（空白 HeaderMap 起步；originator/UA 由 client 默认头提供）。
+     let mut headers = session_headers(ctx);
+     headers.extend(compatibility_headers(&projection));
++    // 承载头（FR-004 唯一 header 通道）：Go 侧已按账号身份 scope 完成的
++    // 官方 x-codex-* 元数据原样注入并覆盖本地投影，使 rust_sidecar 出站
++    // 与 R-Go 直连逐头一致。凭据头（authorization / chatgpt-account-id /
++    // cookie）在解析期已 fail closed，不在承载集合内；本地必需头
++    // （host/content-length/accept/content-type）与 authorization /
++    // chatgpt-account-id 仍由官方 client 与 BearerAuthProvider 自写。
++    headers.extend(ctx.carried_header_map());
+ 
+     // capture 旁路（capture-r1）：请求体校验通过后、发上游前入队
+     // （设计 §6.3）。白名单不匹配 = None，零成本原路径。句柄在上游失败
+diff --git a/codex-rs/codex-transportd/src/transport/websocket.rs b/codex-rs/codex-transportd/src/transport/websocket.rs
+index 82ccb5a6b..c68c63919 100644
+--- a/codex-rs/codex-transportd/src/transport/websocket.rs
++++ b/codex-rs/codex-transportd/src/transport/websocket.rs
+@@ -51,6 +51,12 @@ pub fn build_ws_headers(
+         http::header::HeaderName::from_static("openai-beta"),
+         HeaderValue::from_static(RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE),
+     );
++    // 承载头（FR-004）**有意不注入 WS 握手**：官方 WS 握手头集合就是上面这一套
++    // （`x-client-request-id` = thread id / session-id / thread-id /
++    // x-codex-window-id / openai-beta），turn-metadata 等元数据在 WS 上走 body 的
++    // `client_metadata`，不作为握手头出现
++    // （core/tests/suite/client_websockets.rs 断言 handshake header 为 None）。
++    // 把承载的 HTTP 元数据头塞进 WS 握手会凭空造出官方客户端从不发送的头。
+     headers
+ }
+ 
+-- 
+2.48.1
+

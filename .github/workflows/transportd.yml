@@ -1,0 +1,41 @@
+name: transportd-locked-build
+
+on:
+  push:
+    branches: ["transportd/**", "replay_*"]
+  pull_request:
+    branches: ["transportd/**", "replay_*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
+        with:
+          toolchain: 1.95.0
+          components: clippy,rustfmt,rust-src
+      - name: Locked build (codex-transportd)
+        working-directory: codex-rs
+        run: cargo build --locked -p codex-transportd --release
+      - name: Locked tests (codex-transportd)
+        working-directory: codex-rs
+        run: cargo test --locked -p codex-transportd
+      - name: Clippy
+        working-directory: codex-rs
+        run: cargo clippy --locked -p codex-transportd --no-deps -- -D warnings
+      - name: Emit build-proof digest
+        run: |
+          shasum -a 256 codex-rs/target/release/codex-transportd
+          shasum -a 256 codex-rs/target/release/codex-transportd > build-proof-digest.txt
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: codex-transportd-release
+          path: |
+            codex-rs/target/release/codex-transportd
+            build-proof-digest.txt

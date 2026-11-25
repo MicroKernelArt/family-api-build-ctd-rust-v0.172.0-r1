@@ -1,0 +1,451 @@
+From fac03d05591316239a7814e6f0c4f96560861e17 Mon Sep 17 00:00:00 2001
+From: Shanks <shanks@book>
+Date: Thu, 1 Oct 2026 18:59:50 +0800
+Subject: [PATCH 25/37] feat(transportd): wire the X-CTD-Hookpoint switch (v1
+ default)
+
+Step-5 switch wiring only: v3 takes the same implementation path as v1 and
+differs solely in its observation marker, so no body/header behavior changes.
+
+- contract/headers.rs: parse `X-CTD-Hookpoint` as a closed set (v1|v3),
+  missing = v1 (backward compatible with older Go), unknown value = typed
+  contract error `invalid_hookpoint`, out-of-scope v3 = `invalid_hookpoint_scope`.
+  Same shape as the existing `X-CTD-Proxy-Kind` handling, and both fire during
+  admission, i.e. before any upstream I/O.
+- build_info.rs: advertise `hookpoint_v1` / `hookpoint_v3` in /info CAPABILITIES.
+- observability.rs: RequestObservation carries `hookpoint` and the requests_total
+  key becomes `operation|hookpoint|outcome`.
+- server/mod.rs: low-cardinality entry log in execute_operation_inner.
+
+Tests: absent header = v1, explicit v1 is field-by-field equivalent to absent,
+closed-set parse, invalid value, out-of-scope value, capability advertisement.
+---
+ codex-rs/codex-transportd/src/build_info.rs   |  37 +++++
+ .../codex-transportd/src/contract/headers.rs  | 153 ++++++++++++++++++
+ codex-rs/codex-transportd/src/contract/mod.rs |   1 +
+ .../codex-transportd/src/observability.rs     |  47 +++++-
+ codex-rs/codex-transportd/src/server/http.rs  |   3 +
+ codex-rs/codex-transportd/src/server/mod.rs   |  10 ++
+ 6 files changed, 243 insertions(+), 8 deletions(-)
+
+diff --git a/codex-rs/codex-transportd/src/build_info.rs b/codex-rs/codex-transportd/src/build_info.rs
+index 6d2cedbe6..c7c231748 100644
+--- a/codex-rs/codex-transportd/src/build_info.rs
++++ b/codex-rs/codex-transportd/src/build_info.rs
+@@ -74,4 +74,41 @@ pub const CAPABILITIES: &[&str] = &[
+     "attachment_download",
+     "file_content_fetch",
+     "agent_task_register",
++    // hookpoint 开关（步骤 5）：v1 是默认实现（恒存在）；v3 表示本构建实现了
++    // responses 族的 v3 路径。Go 侧 EnsureReady 据此对 hookpoint==v3 fail
++    // closed，杜绝"Go 已发 v3、旧 ctd 按 v1 服务"的静默混合。
++    "hookpoint_v1",
++    "hookpoint_v3",
+ ];
++
++#[cfg(test)]
++mod tests {
++    use super::CAPABILITIES;
++
++    #[test]
++    fn hookpoint_capabilities_are_advertised() {
++        // 步骤 5：Go 的 EnsureReady 对 hookpoint==v3 做 capability 门。
++        // 若本构建不广告 hookpoint_v3，灰度会被永久挡住（fail closed）；
++        // hookpoint_v1 恒存在（v1 是默认实现）。
++        for required in ["hookpoint_v1", "hookpoint_v3"] {
++            assert!(
++                CAPABILITIES.contains(&required),
++                "capabilities 必须广告 {required}"
++            );
++        }
++    }
++
++    #[test]
++    fn capabilities_are_unique_and_lower_snake_case() {
++        let mut seen = std::collections::BTreeSet::new();
++        for capability in CAPABILITIES {
++            assert!(seen.insert(*capability), "capability 重复：{capability}");
++            assert!(
++                capability
++                    .bytes()
++                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
++                "capability 形状非法：{capability}"
++            );
++        }
++    }
++}
+diff --git a/codex-rs/codex-transportd/src/contract/headers.rs b/codex-rs/codex-transportd/src/contract/headers.rs
+index 49f7e4434..99a2553f2 100644
+--- a/codex-rs/codex-transportd/src/contract/headers.rs
++++ b/codex-rs/codex-transportd/src/contract/headers.rs
+@@ -57,6 +57,11 @@ pub const USER_ID_HEADER: &str = "x-ctd-user-id";
+ /// 编码契约（两端逐字一致）：UTF-8 JSON object，键为小写官方 header 名，
+ /// 值为 Go 侧已按账号身份 scope 完成的最终出站值。
+ pub const CARRIED_HEADERS_HEADER: &str = "x-ctd-carried-headers";
++/// hookpoint 实现开关（Go 侧 mode=rust_sidecar 且 operation ∈ responses 族时
++/// 才会传递）。闭集 `v1|v3`；**缺失 = `v1`**（向后兼容：旧 Go 不传 ⇒ 行为与
++/// 今天逐字一致）；未知值 → typed contract error `invalid_hookpoint`，在任何
++/// upstream I/O 之前 fail closed。解析形态照抄 [`PROXY_KIND_HEADER`]。
++pub const HOOKPOINT_HEADER: &str = "x-ctd-hookpoint";
+ 
+ /// 允许承载到上游投影的官方 header 白名单（小写）。
+ /// 与 Go 侧 `codex_transport_integration.go` 的 `codexCarriedHeaderNames`
+@@ -155,6 +160,9 @@ pub struct RequestContext {
+     /// 解析时只保留 [`CARRIED_HEADER_NAMES`]，凭据键 fail closed；注入端原样
+     /// 写入上游投影（覆盖 sidecar 本地投影）。
+     pub carried_headers: BTreeMap<String, String>,
++    /// hookpoint 开关（v1/v3；缺失 = v1）。v1 与 v3 走同一条实现路径，
++    /// 差异只在观测标记（本任务不实现 v3 语义）。
++    pub hookpoint: Hookpoint,
+     /// 内部 traceparent（只建立 Go→Rust child span；不得复制到 upstream）。
+     pub traceparent: Option<String>,
+ }
+@@ -193,6 +201,50 @@ impl ProxyKind {
+     }
+ }
+ 
++/// Codex hookpoint 实现选择（v1/v3）。闭集枚举，解析形态与 [`ProxyKind`]
++/// 逐字同形。
++///
++/// 作用域：hookpoint 只对 `responses` / `responses_compact` 有定义；Go 侧
++/// 对其它 operation 一律按 v1 处理且不传该头。若越界传入 v3，Rust 侧以
++/// typed contract error `invalid_hookpoint_scope` fail closed。
++///
++/// 本任务只做开关接线：`v3` 与 `v1` 走**同一条实现路径**（携带 v3 标记），
++/// 不引入任何 body/header 行为差异。
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
++pub enum Hookpoint {
++    #[default]
++    V1,
++    V3,
++}
++
++impl Hookpoint {
++    /// 闭集解析：未知值返回 `None`（调用方 fail closed）。
++    pub fn parse(value: &str) -> Option<Self> {
++        match value {
++            "v1" => Some(Self::V1),
++            "v3" => Some(Self::V3),
++            _ => None,
++        }
++    }
++
++    pub fn as_str(&self) -> &'static str {
++        match self {
++            Self::V1 => "v1",
++            Self::V3 => "v3",
++        }
++    }
++
++    /// 该 hookpoint 是否对给定 operation 有定义（作用域收窄）。
++    pub fn supports_operation(&self, operation: Operation) -> bool {
++        match self {
++            // v1 是默认实现，任何 operation 都按 v1 执行。
++            Self::V1 => true,
++            // v3 只覆盖 responses 族（§2.3）。
++            Self::V3 => matches!(operation, Operation::Responses | Operation::ResponsesCompact),
++        }
++    }
++}
++
+ /// 经验证的 v0_144 session 不可变快照（TLS-CTD-001 §11.4）。
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct SessionSnapshot {
+@@ -306,6 +358,30 @@ pub fn parse_request_context(
+         }
+     };
+ 
++    // 5b. hookpoint（闭集 v1|v3；缺失 = v1；未知值 / 越界 fail closed）。
++    // 与 proxy kind 同段、同形；同样在任何 upstream I/O 之前完成。
++    let hookpoint = match header_str(headers, HOOKPOINT_HEADER) {
++        None => Hookpoint::V1,
++        Some(raw) => Hookpoint::parse(raw).ok_or_else(|| {
++            LocalError::new(
++                "invalid_hookpoint",
++                ErrorClass::Contract,
++                ErrorPhase::Validate,
++                false,
++                "unknown X-CTD-Hookpoint",
++            )
++        })?,
++    };
++    if !hookpoint.supports_operation(operation) {
++        return Err(LocalError::new(
++            "invalid_hookpoint_scope",
++            ErrorClass::Contract,
++            ErrorPhase::Validate,
++            false,
++            "X-CTD-Hookpoint=v3 is only defined for responses operations",
++        ));
++    }
++
+     // 6. session snapshot
+     let session = if operation.requires_session() {
+         let session_id = required(headers, SESSION_ID_HEADER, &mut err);
+@@ -418,6 +494,7 @@ pub fn parse_request_context(
+             .map(String::from),
+         user_id: header_str(headers, USER_ID_HEADER).map(String::from),
+         carried_headers: parse_carried_headers(header_str(headers, CARRIED_HEADERS_HEADER))?,
++        hookpoint,
+         traceparent: header_str(headers, "traceparent")
+             .filter(|v| !v.is_empty())
+             .map(ToString::to_string),
+@@ -594,6 +671,82 @@ mod tests {
+         assert_eq!(err.code, "invalid_proxy_kind");
+     }
+ 
++    #[test]
++    fn absent_hookpoint_defaults_to_v1() {
++        // 向后兼容：旧 Go 不传头 ⇒ v1（行为与今天逐字一致）。
++        let ctx = parse_request_context(&base_headers(), Operation::Responses).expect("parse");
++        assert_eq!(ctx.hookpoint, Hookpoint::V1);
++    }
++
++    #[test]
++    fn explicit_v1_is_equivalent_to_absent() {
++        // ★ 默认配置（Go 发 v1）与旧 Go（不传头）必须解析出完全相同的上下文：
++        // 除 hookpoint 字段本身外逐字段相等 ⇒ v1 与"今天"走同一条实现路径。
++        let absent = parse_request_context(&base_headers(), Operation::Responses).expect("parse");
++        let mut headers = base_headers();
++        headers.insert(HOOKPOINT_HEADER, HeaderValue::from_static("v1"));
++        let explicit = parse_request_context(&headers, Operation::Responses).expect("parse");
++
++        assert_eq!(absent.hookpoint, Hookpoint::V1);
++        assert_eq!(explicit.hookpoint, Hookpoint::V1);
++        assert_eq!(explicit.operation, absent.operation);
++        assert_eq!(explicit.request_id, absent.request_id);
++        assert_eq!(explicit.account_key, absent.account_key);
++        assert_eq!(explicit.credential_revision, absent.credential_revision);
++        assert_eq!(explicit.proxy_kind, absent.proxy_kind);
++        assert_eq!(explicit.purpose, absent.purpose);
++        assert_eq!(explicit.session, absent.session);
++        assert_eq!(explicit.carried_headers, absent.carried_headers);
++        assert_eq!(explicit.deadline.is_some(), absent.deadline.is_some());
++        assert_eq!(explicit.admission_timeout_ms, absent.admission_timeout_ms);
++    }
++
++    #[test]
++    fn hookpoint_closed_set_parses() {
++        for (raw, want) in [("v1", Hookpoint::V1), ("v3", Hookpoint::V3)] {
++            let mut headers = base_headers();
++            headers.insert(HOOKPOINT_HEADER, HeaderValue::from_str(raw).expect("value"));
++            let ctx = parse_request_context(&headers, Operation::Responses).expect("parse");
++            assert_eq!(ctx.hookpoint, want);
++            assert_eq!(ctx.hookpoint.as_str(), raw);
++        }
++        // compact 同属 responses 族。
++        let mut headers = base_headers();
++        headers.insert(HOOKPOINT_HEADER, HeaderValue::from_static("v3"));
++        let ctx = parse_request_context(&headers, Operation::ResponsesCompact).expect("parse");
++        assert_eq!(ctx.hookpoint, Hookpoint::V3);
++    }
++
++    #[test]
++    fn rejects_unknown_hookpoint() {
++        let mut headers = base_headers();
++        headers.insert(HOOKPOINT_HEADER, HeaderValue::from_static("v2"));
++        let err = parse_request_context(&headers, Operation::Responses).expect_err("must fail");
++        assert_eq!(err.code, "invalid_hookpoint");
++        assert_eq!(err.class, ErrorClass::Contract);
++        assert_eq!(err.phase, ErrorPhase::Validate);
++    }
++
++    #[test]
++    fn rejects_out_of_scope_hookpoint() {
++        // v3 只对 responses 族有定义；越界传入 fail closed。
++        let mut headers = base_headers();
++        headers.remove(SESSION_ID_HEADER);
++        headers.remove(THREAD_ID_HEADER);
++        headers.remove(WINDOW_ID_HEADER);
++        headers.insert(HOOKPOINT_HEADER, HeaderValue::from_static("v3"));
++        let err = parse_request_context(&headers, Operation::Models).expect_err("must fail");
++        assert_eq!(err.code, "invalid_hookpoint_scope");
++        // 同一 operation 传 v1 合法（v1 是默认实现，处处成立）。
++        let mut headers = base_headers();
++        headers.remove(SESSION_ID_HEADER);
++        headers.remove(THREAD_ID_HEADER);
++        headers.remove(WINDOW_ID_HEADER);
++        headers.insert(HOOKPOINT_HEADER, HeaderValue::from_static("v1"));
++        let ctx = parse_request_context(&headers, Operation::Models).expect("parse");
++        assert_eq!(ctx.hookpoint, Hookpoint::V1);
++    }
++
+     #[test]
+     fn models_operation_does_not_require_session() {
+         let mut headers = base_headers();
+diff --git a/codex-rs/codex-transportd/src/contract/mod.rs b/codex-rs/codex-transportd/src/contract/mod.rs
+index a96ccf1b5..8041aac98 100644
+--- a/codex-rs/codex-transportd/src/contract/mod.rs
++++ b/codex-rs/codex-transportd/src/contract/mod.rs
+@@ -6,6 +6,7 @@ pub mod operation;
+ pub mod operations_snapshot;
+ 
+ pub use error::LocalError;
++pub use headers::Hookpoint;
+ pub use headers::ProxyKind;
+ pub use headers::RequestContext;
+ pub use headers::RequestPurpose;
+diff --git a/codex-rs/codex-transportd/src/observability.rs b/codex-rs/codex-transportd/src/observability.rs
+index c8dbbf182..246e1b6a7 100644
+--- a/codex-rs/codex-transportd/src/observability.rs
++++ b/codex-rs/codex-transportd/src/observability.rs
+@@ -1,12 +1,13 @@
+ //! 低基数观测（TLS-CTD-001 §17）。
+ //!
+-//! 指标只有 operation/outcome/phase/proxy_kind/route_class 等低基数标签；
+-//! 禁止 account id、user id、session/thread/window、request id、token
++//! 指标只有 operation/outcome/phase/proxy_kind/route_class/hookpoint 等低基数
++//! 标签；禁止 account id、user id、session/thread/window、request id、token
+ //! revision 原文、proxy host/URL 作为 label（INV-012）。
+ 
+ use std::sync::atomic::AtomicU64;
+ use std::sync::atomic::Ordering;
+ 
++use crate::contract::Hookpoint;
+ use crate::contract::ProxyKind;
+ use crate::contract::RequestPurpose;
+ use crate::contract::operation::Operation;
+@@ -137,21 +138,27 @@ pub struct RequestObservation {
+     pub operation: Operation,
+     pub proxy_kind: ProxyKind,
+     pub purpose: RequestPurpose,
++    /// hookpoint 开关（v1/v3）：只有两个值，不违反 INV-012 低基数纪律。
++    pub hookpoint: Hookpoint,
+ }
+ 
+ pub fn observe_request_start(metrics: &Metrics, obs: RequestObservation) {
+     let _ = obs;
+     metrics.inflight.fetch_add(1, Ordering::Relaxed);
+-    metrics
+-        .requests_total
+-        .increment(format!("{}|{}", obs.operation.metric_label(), "started"))
++    metrics.requests_total.increment(format!(
++        "{}|{}|{}",
++        obs.operation.metric_label(),
++        obs.hookpoint.as_str(),
++        "started"
++    ));
+ }
+ 
+ pub fn observe_request_end(metrics: &Metrics, obs: RequestObservation, outcome: Outcome) {
+     metrics.inflight.fetch_sub(1, Ordering::Relaxed);
+     metrics.requests_total.increment(format!(
+-        "{}|{}",
++        "{}|{}|{}",
+         obs.operation.metric_label(),
++        obs.hookpoint.as_str(),
+         outcome.as_str()
+     ));
+ }
+@@ -176,12 +183,36 @@ mod tests {
+             operation: Operation::Responses,
+             proxy_kind: ProxyKind::Direct,
+             purpose: RequestPurpose::Request,
++            hookpoint: Hookpoint::V1,
+         };
+         observe_request_start(&metrics, obs);
+         observe_request_end(&metrics, obs, Outcome::Success);
+         let snapshot = metrics.requests_total.snapshot();
+-        assert_eq!(snapshot.get("responses|started"), Some(&1));
+-        assert_eq!(snapshot.get("responses|success"), Some(&1));
++        assert_eq!(snapshot.get("responses|v1|started"), Some(&1));
++        assert_eq!(snapshot.get("responses|v1|success"), Some(&1));
++    }
++
++    #[test]
++    fn hookpoint_splits_the_request_key() {
++        // hookpoint 只有两个取值：A/B 观测在同一 operation 下可区分，
++        // 且基数有界（INV-012）。
++        let metrics = Metrics::default();
++        for hookpoint in [Hookpoint::V1, Hookpoint::V3] {
++            let obs = RequestObservation {
++                operation: Operation::Responses,
++                proxy_kind: ProxyKind::Direct,
++                purpose: RequestPurpose::Request,
++                hookpoint,
++            };
++            observe_request_start(&metrics, obs);
++            observe_request_end(&metrics, obs, Outcome::Success);
++        }
++        let snapshot = metrics.requests_total.snapshot();
++        assert_eq!(snapshot.len(), 4);
++        assert_eq!(snapshot.get("responses|v1|started"), Some(&1));
++        assert_eq!(snapshot.get("responses|v3|started"), Some(&1));
++        assert_eq!(snapshot.get("responses|v1|success"), Some(&1));
++        assert_eq!(snapshot.get("responses|v3|success"), Some(&1));
+     }
+ 
+     #[test]
+diff --git a/codex-rs/codex-transportd/src/server/http.rs b/codex-rs/codex-transportd/src/server/http.rs
+index 113144f1a..d5516fe97 100644
+--- a/codex-rs/codex-transportd/src/server/http.rs
++++ b/codex-rs/codex-transportd/src/server/http.rs
+@@ -76,6 +76,7 @@ pub(crate) async fn handle_http_operation(
+             operation,
+             proxy_kind: ctx.proxy_kind,
+             purpose: ctx.purpose,
++            hookpoint: ctx.hookpoint,
+         },
+     );
+ 
+@@ -83,6 +84,7 @@ pub(crate) async fn handle_http_operation(
+         operation,
+         proxy_kind: ctx.proxy_kind,
+         purpose: ctx.purpose,
++        hookpoint: ctx.hookpoint,
+     };
+     let result = execute_operation(&state, &ctx, body).await;
+     match result {
+@@ -104,6 +106,7 @@ pub(crate) async fn handle_http_operation(
+                     operation,
+                     proxy_kind: ctx.proxy_kind,
+                     purpose: ctx.purpose,
++                    hookpoint: ctx.hookpoint,
+                 },
+                 crate::observability::Outcome::LocalError,
+             );
+diff --git a/codex-rs/codex-transportd/src/server/mod.rs b/codex-rs/codex-transportd/src/server/mod.rs
+index 01d8d797d..088b3ab9c 100644
+--- a/codex-rs/codex-transportd/src/server/mod.rs
++++ b/codex-rs/codex-transportd/src/server/mod.rs
+@@ -291,6 +291,7 @@ pub(crate) async fn execute_operation(
+                 operation: ctx.operation,
+                 proxy_kind: ctx.proxy_kind,
+                 purpose: ctx.purpose,
++                hookpoint: ctx.hookpoint,
+             };
+             Ok(guarded_response(
+                 response,
+@@ -350,6 +351,13 @@ async fn execute_operation_inner(
+     ctx: &RequestContext,
+     body: Bytes,
+ ) -> Result<Response, LocalError> {
++    // 开关接线（步骤 5）：入口打一条低基数日志，标注本次请求实际生效的
++    // hookpoint。v3 与 v1 走同一条实现路径，差异只在这条标记上。
++    tracing::info!(
++        operation = ctx.operation.metric_label(),
++        hookpoint = ctx.hookpoint.as_str(),
++        "executing operation"
++    );
+     // P1 平面（T-012/014/015）：契约已定义，独立 release gate 通过前
+     // 不执行（INV-015 capability 未宣告）。
+     let capability_not_released = || {
+@@ -717,6 +725,7 @@ mod guarded_body_tests {
+                 operation: Operation::Responses,
+                 proxy_kind: crate::contract::headers::ProxyKind::Direct,
+                 purpose: crate::contract::headers::RequestPurpose::Request,
++                hookpoint: crate::contract::headers::Hookpoint::V1,
+             },
+             finished: false,
+         };
+@@ -748,6 +757,7 @@ mod guarded_body_tests {
+                 operation: Operation::Responses,
+                 proxy_kind: crate::contract::headers::ProxyKind::Direct,
+                 purpose: crate::contract::headers::RequestPurpose::Request,
++                hookpoint: crate::contract::headers::Hookpoint::V1,
+             },
+             finished: false,
+         };
+-- 
+2.48.1
+

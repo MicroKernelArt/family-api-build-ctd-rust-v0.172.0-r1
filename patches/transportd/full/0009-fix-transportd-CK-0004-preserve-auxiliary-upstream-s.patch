@@ -1,0 +1,419 @@
+From c32d9f931da6b508e604954c578b57f9b5bea746 Mon Sep 17 00:00:00 2001
+From: Shanks <shanks@book>
+Date: Wed, 9 Sep 2026 00:24:43 +0800
+Subject: [PATCH 09/37] fix(transportd): CK-0004 preserve auxiliary upstream
+ status
+
+(cherry picked from commit 5ecb30d92d406caf292414a1c7207ff7954f87ac)
+---
+ codex-rs/codex-api/src/endpoint/models.rs     |  58 +++++++++-
+ codex-rs/codex-api/src/endpoint/search.rs     |  10 +-
+ .../src/transport/auxiliary.rs                |  12 +-
+ .../tests/upstream_non2xx_preservation.rs     | 108 +++++++++++++-----
+ 4 files changed, 147 insertions(+), 41 deletions(-)
+
+diff --git a/codex-rs/codex-api/src/endpoint/models.rs b/codex-rs/codex-api/src/endpoint/models.rs
+index 723156981..01f6fbac5 100644
+--- a/codex-rs/codex-api/src/endpoint/models.rs
++++ b/codex-rs/codex-api/src/endpoint/models.rs
+@@ -75,9 +75,9 @@ impl<T: HttpTransport> ModelsClient<T> {
+         &self,
+         request_url: String,
+         extra_headers: HeaderMap,
+-    ) -> Result<codex_client::Response, ApiError> {
++    ) -> Result<codex_client::RawRetryOutcome<codex_client::Response>, ApiError> {
+         self.session
+-            .execute_with(
++            .execute_raw_with(
+                 Method::GET,
+                 Self::path(),
+                 extra_headers,
+@@ -170,6 +170,7 @@ mod tests {
+         last_request: Arc<Mutex<Option<Request>>>,
+         body: Arc<ModelsResponse>,
+         etag: Option<String>,
++        status: StatusCode,
+     }
+ 
+     impl Default for CapturingTransport {
+@@ -178,28 +179,53 @@ mod tests {
+                 last_request: Arc::new(Mutex::new(None)),
+                 body: Arc::new(ModelsResponse { models: Vec::new() }),
+                 etag: None,
++                status: StatusCode::OK,
+             }
+         }
+     }
+ 
+     impl HttpTransport for CapturingTransport {
+         async fn execute(&self, req: Request) -> Result<Response, TransportError> {
++            let url = req.url.clone();
+             *self.last_request.lock().unwrap() = Some(req);
+             let body = serde_json::to_vec(&*self.body).unwrap();
+             let mut headers = HeaderMap::new();
+             if let Some(etag) = &self.etag {
+                 headers.insert(ETAG, etag.parse().unwrap());
+             }
+-            Ok(Response {
+-                status: StatusCode::OK,
++            let response = Response {
++                status: self.status,
+                 headers,
+                 body: body.into(),
+-            })
++            };
++            if !response.status.is_success() {
++                return Err(TransportError::Http {
++                    status: response.status,
++                    url: Some(url),
++                    headers: Some(response.headers),
++                    body: String::from_utf8(response.body.to_vec()).ok(),
++                    // 0.159.0 新增字段：测试 transport 不产生 retry advice。
++                    retry_after: None,
++                });
++            }
++            Ok(response)
+         }
+ 
+         async fn stream(&self, _req: Request) -> Result<StreamResponse, TransportError> {
+             Err(TransportError::Build("stream should not run".to_string()))
+         }
++
++        async fn execute_preserving_status(
++            &self,
++            req: Request,
++        ) -> Result<Response, TransportError> {
++            *self.last_request.lock().unwrap() = Some(req);
++            Ok(Response {
++                status: self.status,
++                headers: HeaderMap::new(),
++                body: serde_json::to_vec(&*self.body).unwrap().into(),
++            })
++        }
+     }
+ 
+     #[derive(Clone, Default)]
+@@ -340,6 +366,7 @@ mod tests {
+             last_request: Arc::new(Mutex::new(None)),
+             body: Arc::new(response),
+             etag: None,
++            status: StatusCode::OK,
+         };
+ 
+         let provider = provider("https://example.com/api/codex");
+@@ -403,6 +430,7 @@ mod tests {
+             last_request: Arc::new(Mutex::new(None)),
+             body: Arc::new(response),
+             etag: None,
++            status: StatusCode::OK,
+         };
+ 
+         let provider = provider("https://example.com/api/codex");
+@@ -432,6 +460,7 @@ mod tests {
+             last_request: Arc::new(Mutex::new(None)),
+             body: Arc::new(response),
+             etag: Some("\"abc\"".to_string()),
++            status: StatusCode::OK,
+         };
+ 
+         let provider = provider("https://example.com/api/codex");
+@@ -450,4 +479,23 @@ mod tests {
+         assert_eq!(models.len(), 0);
+         assert_eq!(etag, Some("\"abc\"".to_string()));
+     }
++
++    #[tokio::test]
++    async fn execute_raw_preserves_not_modified() {
++        let transport = CapturingTransport {
++            status: StatusCode::NOT_MODIFIED,
++            ..Default::default()
++        };
++        let provider = provider("https://example.com/api/codex");
++        let request_url = ModelsClient::<CapturingTransport>::request_url(&provider, "0.1.0");
++        let client = ModelsClient::new(transport, provider, Arc::new(DummyAuth));
++
++        let outcome = client
++            .execute_raw(request_url, HeaderMap::new())
++            .await
++            .expect("304 must remain a raw response");
++
++        assert_eq!(outcome.value.status, StatusCode::NOT_MODIFIED);
++        assert_eq!(outcome.attempts, 1);
++    }
+ }
+diff --git a/codex-rs/codex-api/src/endpoint/search.rs b/codex-rs/codex-api/src/endpoint/search.rs
+index 0e8d81586..9ef83aab1 100644
+--- a/codex-rs/codex-api/src/endpoint/search.rs
++++ b/codex-rs/codex-api/src/endpoint/search.rs
+@@ -42,9 +42,15 @@ impl<T: HttpTransport> SearchClient<T> {
+         &self,
+         body: serde_json::Value,
+         extra_headers: HeaderMap,
+-    ) -> Result<codex_client::Response, ApiError> {
++    ) -> Result<codex_client::RawRetryOutcome<codex_client::Response>, ApiError> {
+         self.session
+-            .execute(Method::POST, Self::path(), extra_headers, Some(body))
++            .execute_raw_with(
++                Method::POST,
++                Self::path(),
++                extra_headers,
++                Some(body),
++                |_| {},
++            )
+             .await
+     }
+ 
+diff --git a/codex-rs/codex-transportd/src/transport/auxiliary.rs b/codex-rs/codex-transportd/src/transport/auxiliary.rs
+index c9af53932..869d26985 100644
+--- a/codex-rs/codex-transportd/src/transport/auxiliary.rs
++++ b/codex-rs/codex-transportd/src/transport/auxiliary.rs
+@@ -53,12 +53,14 @@ pub async fn execute_models_raw(
+         headers.insert(http::header::IF_NONE_MATCH, value);
+     }
+ 
+-    let response = api_client
++    let outcome = api_client
+         .execute_raw(request_url, headers)
+         .await
+         .map_err(|err| crate::transport::responses::map_api_error(err, "models"))?;
+ 
+-    raw_from_response(response, Operation::Models)
++    let mut raw = raw_from_response(outcome.value, Operation::Models)?;
++    raw.attempt_count = u32::try_from(outcome.attempts).unwrap_or(u32::MAX);
++    Ok(raw)
+ }
+ 
+ /// 执行 alpha search 原始请求（session-less）。
+@@ -95,12 +97,14 @@ pub async fn execute_alpha_search_raw(
+     let api_client =
+         codex_api::SearchClient::new(official_adapter::transport_for(client), provider, auth);
+ 
+-    let response = api_client
++    let outcome = api_client
+         .execute_raw(value, HeaderMap::new())
+         .await
+         .map_err(|err| crate::transport::responses::map_api_error(err, "alpha_search"))?;
+ 
+-    raw_from_response(response, Operation::AlphaSearch)
++    let mut raw = raw_from_response(outcome.value, Operation::AlphaSearch)?;
++    raw.attempt_count = u32::try_from(outcome.attempts).unwrap_or(u32::MAX);
++    Ok(raw)
+ }
+ 
+ /// 执行 usage/quota 原始请求（WHAM 官方路径，无官方解析 client；
+diff --git a/codex-rs/codex-transportd/tests/upstream_non2xx_preservation.rs b/codex-rs/codex-transportd/tests/upstream_non2xx_preservation.rs
+index 697b361dd..bce064d94 100644
+--- a/codex-rs/codex-transportd/tests/upstream_non2xx_preservation.rs
++++ b/codex-rs/codex-transportd/tests/upstream_non2xx_preservation.rs
+@@ -11,7 +11,8 @@
+ 
+ #![cfg(feature = "test-upstream")]
+ 
+-use std::io::{Read, Write};
++use std::io::Read;
++use std::io::Write;
+ use std::process::Command;
+ use std::sync::Arc;
+ use std::sync::atomic::AtomicUsize;
+@@ -19,7 +20,7 @@ use std::sync::atomic::Ordering;
+ 
+ /// worker 测试名（子进程 --exact 过滤）。
+ const WORKER_TEST: &str = "non2xx_preservation_worker";
+-/// 场景 env：`<uds|direct>|<responses|compact>|<script>|<expected_attempts>`。
++/// 场景 env：`<uds|direct>|<operation>|<script>|<expected_attempts>`。
+ const SCENARIO_ENV: &str = "CTD_NON2XX_SCENARIO";
+ const CHILD_ENV: &str = "CTD_NON2XX_CHILD";
+ 
+@@ -34,11 +35,13 @@ const BODY_403: &[u8] =
+ const BODY_429: &[u8] = b"{\"error\":{\"code\":\"rate_limited\"}}";
+ const BODY_500: &[u8] = b"{\"error\":{\"code\":\"boom\"}}";
+ const BODY_SSE_OK: &[u8] = b"retry: 0\n\n";
++const BODY_304: &[u8] = b"";
+ 
+ /// `(status, body)` 序列：按连接次数消费，超出后停留在最后一项。
+ fn script_for(name: &str) -> Vec<(u16, &'static [u8])> {
+     match name {
+         "403" => vec![(403, BODY_403)],
++        "304" => vec![(304, BODY_304)],
+         "429" => vec![(429, BODY_429)],
+         "500x4" => vec![
+             (500, BODY_500),
+@@ -54,6 +57,7 @@ fn script_for(name: &str) -> Vec<(u16, &'static [u8])> {
+ fn expected_status(script: &str) -> u16 {
+     match script {
+         "403" => 403,
++        "304" => 304,
+         "429" => 429,
+         // 5xx 在官方 retry（max_attempts=4, retry_5xx）耗尽后原样返回。
+         "500x4" => 500,
+@@ -65,6 +69,7 @@ fn expected_status(script: &str) -> u16 {
+ fn expected_body(script: &str) -> &'static [u8] {
+     match script {
+         "403" => BODY_403,
++        "304" => BODY_304,
+         "429" => BODY_429,
+         "500x4" => BODY_500,
+         "500_200" => BODY_SSE_OK,
+@@ -93,6 +98,13 @@ fn spawn_mock(script: Vec<(u16, &'static [u8])>) -> MockUpstream {
+             let (status, body) = script[idx.min(script.len() - 1)];
+             let head = read_request_head_and_body(&mut sock);
+             assert!(!head.is_empty(), "mock upstream got an empty request");
++            if status == 304 {
++                let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
++                assert!(
++                    head.contains("if-none-match: \"models-etag\""),
++                    "304 models request must forward If-None-Match: {head}"
++                );
++            }
+             let reason = if status == 200 { "OK" } else { "Error" };
+             let resp = format!(
+                 "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+@@ -174,6 +186,8 @@ fn uds_preserves_terminal_403_429_and_exhausted_5xx() {
+         "uds|responses|429|1",
+         "uds|responses|500x4|5",
+         "uds|compact|403|1",
++        "uds|models|403|1",
++        "uds|models|304|1",
+     ] {
+         let script = script_for(scenario.split('|').nth(2).expect("script field"));
+         let mock = spawn_mock(script);
+@@ -202,6 +216,8 @@ fn direct_preserves_retry_then_success_and_exhaustion() {
+         "direct|responses|403|1",
+         "direct|compact|500_200|2",
+         "direct|compact|500x4|5",
++        "direct|models|403|1",
++        "direct|search|403|1",
+     ] {
+         let script = script_for(scenario.split('|').nth(2).expect("script field"));
+         let mock = spawn_mock(script);
+@@ -311,29 +327,47 @@ async fn non2xx_preservation_worker() {
+     let expected_body = expected_body(&script);
+     match mode.as_str() {
+         "direct" => {
+-            let operation = if op == "compact" {
+-                codex_transportd::contract::operation::Operation::ResponsesCompact
+-            } else {
+-                codex_transportd::contract::operation::Operation::Responses
++            let operation = match op.as_str() {
++                "responses" => codex_transportd::contract::operation::Operation::Responses,
++                "compact" => codex_transportd::contract::operation::Operation::ResponsesCompact,
++                "models" => codex_transportd::contract::operation::Operation::Models,
++                "search" => codex_transportd::contract::operation::Operation::AlphaSearch,
++                other => panic!("unknown direct operation {other}"),
+             };
+-            let ctx = worker_ctx(operation);
++            let mut ctx = worker_ctx(operation);
++            if script == "304" {
++                ctx.if_none_match = Some("\"models-etag\"".to_string());
++            }
+             let body = worker_body();
+-            let result = if op == "compact" {
+-                codex_transportd::transport::compact::execute_compact_raw(
+-                    &pool,
+-                    "installation-1",
+-                    &ctx,
+-                    body,
+-                )
+-                .await
+-            } else {
+-                codex_transportd::transport::responses::execute_responses_raw(
+-                    &pool,
+-                    "installation-1",
+-                    &ctx,
+-                    body,
+-                )
+-                .await
++            let result = match op.as_str() {
++                "responses" => {
++                    codex_transportd::transport::responses::execute_responses_raw(
++                        &pool,
++                        "installation-1",
++                        &ctx,
++                        body,
++                    )
++                    .await
++                }
++                "compact" => {
++                    codex_transportd::transport::compact::execute_compact_raw(
++                        &pool,
++                        "installation-1",
++                        &ctx,
++                        body,
++                    )
++                    .await
++                }
++                "models" => {
++                    codex_transportd::transport::auxiliary::execute_models_raw(&pool, &ctx).await
++                }
++                "search" => {
++                    codex_transportd::transport::auxiliary::execute_alpha_search_raw(
++                        &pool, &ctx, body,
++                    )
++                    .await
++                }
++                other => panic!("unknown direct operation {other}"),
+             };
+             let mut raw = result.unwrap_or_else(|err| {
+                 panic!("terminal upstream response must be preserved: {err:?}")
+@@ -352,7 +386,7 @@ async fn non2xx_preservation_worker() {
+             assert!(raw.headers.get("x-ctd-origin").is_none());
+         }
+         "uds" => {
+-            let (status, headers, body) = uds_round_trip(&op).await;
++            let (status, headers, body) = uds_round_trip(&op, &script).await;
+             assert_eq!(status, expected_status, "op {op} script {script}");
+             assert_eq!(
+                 headers.get("x-ctd-origin").map(String::as_str),
+@@ -370,7 +404,10 @@ async fn non2xx_preservation_worker() {
+ 
+ /// UDS 端到端：起 serve()，手工 HTTP/1.1 over UnixStream 打内部端点，
+ /// 返回 (status, headers, body)。
+-async fn uds_round_trip(op: &str) -> (u16, std::collections::HashMap<String, String>, Vec<u8>) {
++async fn uds_round_trip(
++    op: &str,
++    script: &str,
++) -> (u16, std::collections::HashMap<String, String>, Vec<u8>) {
+     let dir = tempfile::TempDir::new().expect("tempdir");
+     let config = codex_transportd::config::Config {
+         codex_home: dir.path().join("home"),
+@@ -406,14 +443,24 @@ async fn uds_round_trip(op: &str) -> (u16, std::collections::HashMap<String, Str
+     .await;
+     assert_eq!(health_status, 200, "health probe failed: {health_body:?}");
+ 
+-    let path = if op == "compact" {
+-        "/_internal/v1/responses/compact"
++    let (method, path) = match op {
++        "responses" => ("POST", "/_internal/v1/responses"),
++        "compact" => ("POST", "/_internal/v1/responses/compact"),
++        "models" => ("GET", "/_internal/v1/models"),
++        other => panic!("unknown UDS operation {other}"),
++    };
++    let body = if method == "GET" {
++        bytes::Bytes::new()
++    } else {
++        worker_body()
++    };
++    let if_none_match = if op == "models" && script == "304" {
++        "x-ctd-if-none-match: \"models-etag\"\r\n"
+     } else {
+-        "/_internal/v1/responses"
++        ""
+     };
+-    let body = worker_body();
+     let request = format!(
+-        "POST {path} HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\
++        "{method} {path} HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\
+          x-ctd-protocol-version: 1\r\n\
+          x-ctd-request-id: req-non2xx-uds\r\n\
+          x-ctd-account-key: acct\r\n\
+@@ -423,6 +470,7 @@ async fn uds_round_trip(op: &str) -> (u16, std::collections::HashMap<String, Str
+          x-ctd-session-id: 0198f2b0-0000-7000-8000-000000000001\r\n\
+          x-ctd-thread-id: 0198f2b0-0000-7000-8000-000000000002\r\n\
+          x-ctd-window-id: 0198f2b0-0000-7000-8000-000000000002:1\r\n\
++         {if_none_match}\
+          content-length: {}\r\n\r\n",
+         body.len()
+     );
+-- 
+2.48.1
+

@@ -1,0 +1,81 @@
+From 7b5baabbe958dfd3f7565418f8d807ae1764b33d Mon Sep 17 00:00:00 2001
+From: Shanks <shanks@book>
+Date: Mon, 7 Sep 2026 16:50:05 +0800
+Subject: [PATCH 04/37] replay0905-patch(4/8): websocket-client
+ connect_with_route
+
+(cherry picked from commit 6581ca6873492a5cee087702792b3b3f5511bf3f)
+---
+ codex-rs/websocket-client/src/cookie_tests.rs |  2 +-
+ codex-rs/websocket-client/src/lib.rs          | 28 +++++++++++++++++--
+ 2 files changed, 26 insertions(+), 4 deletions(-)
+
+diff --git a/codex-rs/websocket-client/src/cookie_tests.rs b/codex-rs/websocket-client/src/cookie_tests.rs
+index 1d48eab20..a21208635 100644
+--- a/codex-rs/websocket-client/src/cookie_tests.rs
++++ b/codex-rs/websocket-client/src/cookie_tests.rs
+@@ -179,7 +179,7 @@ async fn websocket_handshakes_share_routing_cookies_and_respect_cookie_scope() {
+                 .insert(COOKIE, HeaderValue::from_static(cookie));
+         }
+         let result = connector
+-            .connect_with_route(
++            .connect_with_route_inner(
+                 request,
+                 WebSocketConfig::default(),
+                 std::future::ready(Ok(OutboundProxyRoute::Proxy {
+diff --git a/codex-rs/websocket-client/src/lib.rs b/codex-rs/websocket-client/src/lib.rs
+index 28dbe2148..d24973912 100644
+--- a/codex-rs/websocket-client/src/lib.rs
++++ b/codex-rs/websocket-client/src/lib.rs
+@@ -122,7 +122,7 @@ impl WebSocketConnector {
+         let route = self
+             .http_client_factory
+             .resolve_proxy_route_async(request.uri().to_string());
+-        self.connect_with_route(request, config, route, /*loopback_direct*/ false)
++        self.connect_with_route_inner(request, config, route, /*loopback_direct*/ false)
+             .await
+     }
+ 
+@@ -139,7 +139,7 @@ impl WebSocketConnector {
+                 "direct WebSocket connections require a loopback destination",
+             )));
+         }
+-        self.connect_with_route(
++        self.connect_with_route_inner(
+             request,
+             config,
+             std::future::ready(Ok(OutboundProxyRoute::Direct)),
+@@ -148,7 +148,29 @@ impl WebSocketConnector {
+         .await
+     }
+ 
+-    async fn connect_with_route(
++    /// Connects a WebSocket using an explicit sidecar-selected route
++    /// (TLS-CTD-001 FR-016 / FR-017).
++    ///
++    /// The route is pinned by the caller (per-account proxy route from Go);
++    /// system discovery and process environment proxies are never consulted.
++    /// `Direct` bypasses all environment proxy handling; a `Proxy { url }`
++    /// route failure never falls back to direct.
++    pub async fn connect_with_route(
++        &self,
++        request: Request,
++        config: WebSocketConfig,
++        proxy_route: OutboundProxyRoute,
++    ) -> Result<(WebSocketConnection, Response), WebSocketError> {
++        self.connect_with_route_inner(
++            request,
++            config,
++            std::future::ready(Ok(proxy_route)),
++            /*loopback_direct*/ false,
++        )
++        .await
++    }
++
++    async fn connect_with_route_inner(
+         &self,
+         mut request: Request,
+         config: WebSocketConfig,
+-- 
+2.48.1
+

@@ -1,0 +1,61 @@
+[package]
+name = "codex-transportd"
+# P3-4: File::try_lock 需要 Rust >= 1.89（显式声明 MSRV）。
+rust-version = "1.89"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Codex transport sidecar: UDS-only closed operations over the official rust-v0.172.0 transport"
+publish = false
+
+[features]
+# TLS-CTD-001 §15.2：测试目标 override，仅测试构建启用；production CI
+# 必须证明该 feature 关闭（cargo build --release --no-default-features）。
+test-upstream = []
+
+[[bin]]
+name = "codex-transportd"
+path = "src/main.rs"
+
+[dependencies]
+codex-api = { path = "../codex-api" }
+codex-client = { path = "../codex-client" }
+codex-core = { path = "../core" }
+codex-http-client = { path = "../http-client" }
+codex-login = { path = "../login" }
+codex-agent-identity = { path = "../agent-identity" }
+codex-model-provider-info = { path = "../model-provider-info" }
+codex-model-provider = { path = "../model-provider" }
+codex-utils-absolute-path = { path = "../utils/absolute-path" }
+codex-websocket-client = { path = "../websocket-client" }
+axum = { workspace = true, default-features = false, features = [
+    "http1",
+    "json",
+    "tokio",
+    "ws",
+] }
+bytes = { workspace = true }
+futures = { workspace = true }
+http = { workspace = true }
+http-body-util = "0.1"
+libc = { workspace = true }
+hyper-util = "0.1"
+reqwest = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+url = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+uuid = { workspace = true }
+# 出站 body 现为 zstd 压缩体（官方形态）；出站契约测试必须能解压核对。
+zstd = { workspace = true }
+
+[build-dependencies]
+sha2 = "0.10"

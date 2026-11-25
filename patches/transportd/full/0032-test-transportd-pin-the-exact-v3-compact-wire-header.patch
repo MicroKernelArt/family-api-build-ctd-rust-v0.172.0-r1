@@ -1,0 +1,59 @@
+From ef3bdb60e48e3f3b8186228f3c188e1ae475c46a Mon Sep 17 00:00:00 2001
+From: Shanks <shanks@book>
+Date: Fri, 2 Oct 2026 00:10:30 +0800
+Subject: [PATCH 32/37] test(transportd): pin the exact v3 compact wire header
+ sequence
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+上一提交的 compact 线上形态测试只断言了 16 名前缀（`starts_with`）。
+实测 wire 序为 18 名、与 /responses 同一尾部形态，故收紧为**逐位相等**：
+
+  version → x-codex-installation-id → x-codex-beta-features → x-codex-window-id
+  → x-codex-turn-metadata → x-openai-internal-codex-responses-lite
+  → x-codex-routing-hint → x-client-request-id → session-id → thread-id
+  → accept → content-type → authorization → chatgpt-account-id
+  → originator → user-agent → host → content-length
+
+前缀断言会放过"尾部多出/少掉一个头"（如 compact 混进 responses 的
+`text/event-stream` 形态或漏掉 auth 段），逐位断言不会。与 v1/v3 既有的
+`OFFICIAL_POST_HEADER_SEQUENCE` 断言口径一致（同一传输栈 + 同一 mock 环境）。
+---
+ .../codex-transportd/src/transport/responses_v3.rs   | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/codex-rs/codex-transportd/src/transport/responses_v3.rs b/codex-rs/codex-transportd/src/transport/responses_v3.rs
+index 91532615b..d1a1b7e38 100644
+--- a/codex-rs/codex-transportd/src/transport/responses_v3.rs
++++ b/codex-rs/codex-transportd/src/transport/responses_v3.rs
+@@ -1242,8 +1242,9 @@ mod tests {
+             .expect("mock captured the request");
+ 
+         let names = head_header_names(&head);
+-        assert!(
+-            names.starts_with(&[
++        assert_eq!(
++            names,
++            vec![
+                 "version".to_string(),
+                 "x-codex-installation-id".to_string(),
+                 "x-codex-beta-features".to_string(),
+@@ -1260,9 +1261,12 @@ mod tests {
+                 "chatgpt-account-id".to_string(),
+                 "originator".to_string(),
+                 "user-agent".to_string(),
+-            ]),
++                "host".to_string(),
++                "content-length".to_string(),
++            ],
+             "v3 compact 出站头序必须为「version → installation → 官方元数据序 → \
+-             accept → content-type → auth → originator → user-agent」\n{names:?}"
++             accept → content-type → auth → originator → user-agent → host → \
++             content-length」\n{head}"
+         );
+         assert_eq!(
+             header_value(&head, "x-codex-installation-id"),
+-- 
+2.48.1
+

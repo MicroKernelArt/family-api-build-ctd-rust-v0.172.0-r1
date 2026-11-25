@@ -1,0 +1,152 @@
+From 6d4480a18cdb14c0eb30ad4fd7d31743a68ef681 Mon Sep 17 00:00:00 2001
+From: Shanks <shanks@book>
+Date: Wed, 9 Sep 2026 01:12:35 +0800
+Subject: [PATCH 15/37] fix(transportd): CX-0002 bound pre-admission UDS
+ connections
+
+(cherry picked from commit f205843251749b9f476a182fab6eb6900491de7f)
+---
+ codex-rs/codex-transportd/src/limits.rs       |  4 +
+ codex-rs/codex-transportd/src/server/mod.rs   |  8 ++
+ .../tests/uds_connection_limits.rs            | 77 +++++++++++++++++++
+ 3 files changed, 89 insertions(+)
+ create mode 100644 codex-rs/codex-transportd/tests/uds_connection_limits.rs
+
+diff --git a/codex-rs/codex-transportd/src/limits.rs b/codex-rs/codex-transportd/src/limits.rs
+index 3bcad6156..70e25adfb 100644
+--- a/codex-rs/codex-transportd/src/limits.rs
++++ b/codex-rs/codex-transportd/src/limits.rs
+@@ -5,6 +5,9 @@
+ /// 全局并发 in-flight 请求上限。
+ pub const MAX_INFLIGHT: usize = 64;
+ 
++/// UDS accepted connection 上限（包含尚未完成请求头解析的连接）。
++pub const MAX_UDS_CONNECTIONS: usize = 128;
++
+ /// WS 并发连接上限（1:1）。
+ pub const MAX_WS_CONNECTIONS: usize = 32;
+ 
+@@ -46,6 +49,7 @@ mod tests {
+     fn limits_are_static_and_positive() {
+         // const 断言在编译期验证（避免 clippy constant assertion）。
+         const _: () = assert!(MAX_INFLIGHT > 0);
++        const _: () = assert!(MAX_UDS_CONNECTIONS > 0);
+         const _: () = assert!(MAX_WS_CONNECTIONS > 0);
+         const _: () = assert!(MAX_BODY_BYTES > 0);
+         const _: () = assert!(MAX_HEADER_BYTES > 0);
+diff --git a/codex-rs/codex-transportd/src/server/mod.rs b/codex-rs/codex-transportd/src/server/mod.rs
+index a5e5bcc87..1e3c42ab5 100644
+--- a/codex-rs/codex-transportd/src/server/mod.rs
++++ b/codex-rs/codex-transportd/src/server/mod.rs
+@@ -115,17 +115,25 @@ pub async fn serve(config: Config) -> Result<(), String> {
+     }
+ 
+     let app = router().with_state(state);
++    let connection_slots = Arc::new(Semaphore::new(limits::MAX_UDS_CONNECTIONS));
+ 
+     loop {
++        let permit = connection_slots
++            .clone()
++            .acquire_owned()
++            .await
++            .map_err(|err| format!("UDS connection semaphore closed: {err}"))?;
+         let (stream, _addr) = match listener.accept().await {
+             Ok(accepted) => accepted,
+             Err(err) => {
++                drop(permit);
+                 tracing::error!(error = %err, "uds accept failed");
+                 continue;
+             }
+         };
+         let app = app.clone();
+         tokio::spawn(async move {
++            let _connection_permit = permit;
+             let io = TokioIo::new(stream);
+             let service = hyper_util::service::TowerToHyperService::new(app);
+             // upgrade 支持（WS 依赖）：serve_connection_with_upgrades 在 101
+diff --git a/codex-rs/codex-transportd/tests/uds_connection_limits.rs b/codex-rs/codex-transportd/tests/uds_connection_limits.rs
+new file mode 100644
+index 000000000..ed8d9a202
+--- /dev/null
++++ b/codex-rs/codex-transportd/tests/uds_connection_limits.rs
+@@ -0,0 +1,77 @@
++//! UDS connections are bounded before Hyper parses a complete request.
++
++use std::time::Duration;
++
++use tokio::io::AsyncReadExt;
++use tokio::io::AsyncWriteExt;
++
++#[tokio::test]
++async fn uds_connections_are_bounded_before_request_admission() {
++    let dir = tempfile::TempDir::new().expect("tempdir");
++    let socket_path = dir.path().join("transportd.sock");
++    let config = codex_transportd::config::Config {
++        codex_home: dir.path().join("home"),
++        socket_path: socket_path.clone(),
++        image_digest_override: None,
++        build_proof_digest_override: None,
++        socket_dir_expected_uid: None,
++        socket_dir_expected_gid: None,
++    };
++    let server = tokio::spawn(codex_transportd::server::serve(config));
++    while !socket_path.exists() {
++        assert!(!server.is_finished(), "server exited before binding");
++        tokio::task::yield_now().await;
++    }
++
++    let mut partial_clients = Vec::with_capacity(codex_transportd::limits::MAX_UDS_CONNECTIONS);
++    for _ in 0..codex_transportd::limits::MAX_UDS_CONNECTIONS {
++        let mut stream = tokio::net::UnixStream::connect(&socket_path)
++            .await
++            .expect("connect partial-header client");
++        stream
++            .write_all(b"GET /_internal/v1/health/live HTTP/1.1\r\nhost: localhost\r\nx-partial:")
++            .await
++            .expect("write partial request headers");
++        partial_clients.push(stream);
++        tokio::task::yield_now().await;
++    }
++
++    let health_socket = socket_path.clone();
++    let mut health = tokio::spawn(async move {
++        let mut stream = tokio::net::UnixStream::connect(health_socket)
++            .await
++            .expect("connect health client");
++        stream
++            .write_all(
++                b"GET /_internal/v1/health/live HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n",
++            )
++            .await
++            .expect("write health request");
++        let mut response = Vec::new();
++        stream
++            .read_to_end(&mut response)
++            .await
++            .expect("read health response");
++        response
++    });
++
++    assert!(
++        tokio::time::timeout(Duration::from_millis(200), &mut health)
++            .await
++            .is_err(),
++        "health request must wait while all UDS connection slots are occupied"
++    );
++
++    partial_clients.pop();
++    let response = tokio::time::timeout(Duration::from_secs(2), health)
++        .await
++        .expect("health request should progress after one connection closes")
++        .expect("health task");
++    assert!(
++        response.starts_with(b"HTTP/1.1 200"),
++        "unexpected health response: {}",
++        String::from_utf8_lossy(&response)
++    );
++
++    server.abort();
++}
+-- 
+2.48.1
+

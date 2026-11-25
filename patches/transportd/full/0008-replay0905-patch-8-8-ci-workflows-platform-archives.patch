@@ -1,0 +1,485 @@
+From fe08fb9996e8bf01b82b9b38a2c3deb80677f38f Mon Sep 17 00:00:00 2001
+From: Shanks <shanks@book>
+Date: Mon, 7 Sep 2026 16:50:05 +0800
+Subject: [PATCH 08/37] replay0905-patch(8/8): ci workflows + platform archives
+
+(cherry picked from commit 148b34118050f2e2135b610ee3031612386cc171)
+---
+ .../rust-ci-full-nextest-platform.yml         |   9 +
+ .../workflows/transportd-release-gates.yml    |  62 +++++++
+ .github/workflows/transportd.yml              |  41 +++++
+ .github/workflows/worker-ci.yml               | 173 ++++++++++++++++++
+ codex-rs/scripts/check-platform-archives.sh   | 141 ++++++++++++++
+ 5 files changed, 426 insertions(+)
+ create mode 100644 .github/workflows/transportd-release-gates.yml
+ create mode 100644 .github/workflows/transportd.yml
+ create mode 100644 .github/workflows/worker-ci.yml
+ create mode 100755 codex-rs/scripts/check-platform-archives.sh
+
+diff --git a/.github/workflows/rust-ci-full-nextest-platform.yml b/.github/workflows/rust-ci-full-nextest-platform.yml
+index 474535267..2f3624ea7 100644
+--- a/.github/workflows/rust-ci-full-nextest-platform.yml
++++ b/.github/workflows/rust-ci-full-nextest-platform.yml
+@@ -171,9 +171,18 @@ jobs:
+           set -euo pipefail
+           archive_dir="${RUNNER_TEMP}/nextest-archive"
+           mkdir -p "${archive_dir}"
++          # R-PLATFORM-001：Unix-only crate 明确退出 Windows 全 workspace
++          # 测试档案（UDS server / Unix fd capture writer 不以 Windows 为
++          # 目标平台，不伪装支持）；受支持的 Unix 目标档案保持完整覆盖。
++          # 策略 gate：codex-rs/scripts/check-platform-archives.sh
++          archive_excludes=()
++          case "${CODEX_CI_TARGET}" in
++            *-pc-windows-msvc) archive_excludes+=(--exclude codex-transportd) ;;
++          esac
+           cargo nextest archive \
+             --target "${CODEX_CI_TARGET}" \
+             --cargo-profile "${CODEX_CI_PROFILE}" \
++            "${archive_excludes[@]}" \
+             --timings \
+             --archive-file "${archive_dir}/${NEXTEST_ARCHIVE_FILE}"
+ 
+diff --git a/.github/workflows/transportd-release-gates.yml b/.github/workflows/transportd-release-gates.yml
+new file mode 100644
+index 000000000..61410e4b6
+--- /dev/null
++++ b/.github/workflows/transportd-release-gates.yml
+@@ -0,0 +1,62 @@
++# transportd release gates（R8）：CI 不能在任何 release gate 未闭合时
++# 批准发布。两个 job 严格分离：
++#
++#   pre-release-gates   — push/branch（transportd/**）：export gate +
++#                         pre-release evidence gate + 本静态测试。
++#                         pre-release 绝不构成 release 批准。
++#   release-approval    — 仅 tag（transportd/**）：release-tag-verify
++#                         （release 旗标由脚本内部调用）+ wire gate + SBOM gate。
++#
++# 不可变输入约束（R8 / F-0003 / F-0004）：
++#   - 零外部 Action（无 uses:）——不存在可漂移的第三方引用；
++#   - 工具链由仓库内 rust-toolchain.toml 精确固定（1.95.0），rustup 自动解析；
++#   - 任何 gate step 禁止错误吞没开关（失败即红）；
++#   - release-tag-verify.sh 以默认声明 tag 调用（不接受 release 旗标参数）；
++#   - 本文件任何位置不得出现 release 旗标字面量（由 ci-gates-static-test.sh 拒绝）。
++name: transportd-release-gates
++
++on:
++  pull_request:
++    branches: ["transportd/**", "replay_*"]
++  push:
++    branches: ["transportd/**", "replay_*"]
++    tags: ["transportd/**"]
++
++env:
++  CARGO_TERM_COLOR: always
++  CARGO_BUILD_JOBS: "2"
++
++jobs:
++  pre-release-gates:
++    if: github.event_name == 'pull_request' || (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/'))
++    runs-on: ubuntu-24.04
++    steps:
++      - name: Checkout (full history for export replay)
++        run: |
++          git init .
++          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
++          git fetch origin --tags "+${GITHUB_REF}"
++          git checkout --force FETCH_HEAD
++      - name: Export gate（manifest 驱动系列完整性；summary 只读校验）
++        run: bash patches/transportd/tools/export-gate.sh
++      - name: Evidence gate（pre-release 模式；不构成 release 批准）
++        run: bash patches/transportd/tools/release-evidence-gate.sh
++      - name: Static CI gate test（gate 集与模式分离的结构断言）
++        run: bash patches/transportd/tools/ci-gates-static-test.sh
++
++  release-approval-gates:
++    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
++    runs-on: ubuntu-24.04
++    steps:
++      - name: Checkout tagged tree (full history)
++        run: |
++          git init .
++          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
++          git fetch origin --tags "+${GITHUB_REF}"
++          git checkout --force FETCH_HEAD
++      - name: Release tag verification（声明 tag；release 旗标由脚本内部执行）
++        run: bash patches/transportd/tools/release-tag-verify.sh
++      - name: Wire gate（wire 证据未闭合则失败）
++        run: bash patches/transportd/tools/wire-gate.sh
++      - name: SBOM gate（摘要 TBD/未绑定则失败）
++        run: bash patches/transportd/tools/sbom-gate.sh
+diff --git a/.github/workflows/transportd.yml b/.github/workflows/transportd.yml
+new file mode 100644
+index 000000000..963e69c99
+--- /dev/null
++++ b/.github/workflows/transportd.yml
+@@ -0,0 +1,41 @@
++name: transportd-locked-build
++
++on:
++  push:
++    branches: ["transportd/**", "replay_*"]
++  pull_request:
++    branches: ["transportd/**", "replay_*"]
++
++env:
++  CARGO_TERM_COLOR: always
++
++jobs:
++  build-test:
++    runs-on: ubuntu-24.04
++    steps:
++      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
++        with:
++          fetch-depth: 0
++      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
++        with:
++          toolchain: 1.95.0
++          components: clippy,rustfmt,rust-src
++      - name: Locked build (codex-transportd)
++        working-directory: codex-rs
++        run: cargo build --locked -p codex-transportd --release
++      - name: Locked tests (codex-transportd)
++        working-directory: codex-rs
++        run: cargo test --locked -p codex-transportd
++      - name: Clippy
++        working-directory: codex-rs
++        run: cargo clippy --locked -p codex-transportd --no-deps -- -D warnings
++      - name: Emit build-proof digest
++        run: |
++          shasum -a 256 codex-rs/target/release/codex-transportd
++          shasum -a 256 codex-rs/target/release/codex-transportd > build-proof-digest.txt
++      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
++        with:
++          name: codex-transportd-release
++          path: |
++            codex-rs/target/release/codex-transportd
++            build-proof-digest.txt
+diff --git a/.github/workflows/worker-ci.yml b/.github/workflows/worker-ci.yml
+new file mode 100644
+index 000000000..6dd064487
+--- /dev/null
++++ b/.github/workflows/worker-ci.yml
+@@ -0,0 +1,173 @@
++name: worker-ci
++
++on:
++  push:
++    branches: ["ci/family-api-codex/**"]
++  workflow_dispatch:
++    inputs:
++      expected_sha:
++        description: Full candidate commit SHA
++        required: true
++        type: string
++
++permissions:
++  contents: read
++
++concurrency:
++  group: worker-ci-${{ github.ref }}
++  cancel-in-progress: false
++
++env:
++  CARGO_TERM_COLOR: always
++  CARGO_BUILD_JOBS: "2"
++  # R3-LINK-001: ld died with signal 7 [Bus error] at the final lib-test
++  # link on runs 33472913683 and 33498330072 — identical bounded stage,
++  # zero product changes between them (hosted linker/runner resource
++  # failure). Run 33502997032 then failed with 'No space left on device
++  # (os error 28)' writing target/release artifacts to the small root
++  # disk — the same resource-exhaustion family with exact evidence.
++  # CI-only mitigation: strip dev/test debuginfo (less to link) and keep
++  # the cargo target dir on /mnt (the large runner disk). Release profile
++  # and the receipt-bound `cargo build --release` are unaffected.
++  CARGO_PROFILE_DEV_DEBUG: "0"
++  CARGO_PROFILE_TEST_DEBUG: "0"
++  CARGO_TARGET_DIR: /mnt/ci-target
++
++jobs:
++  identity:
++    runs-on: ubuntu-24.04
++    steps:
++      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
++        with:
++          fetch-depth: 0
++          persist-credentials: false
++      - name: Bind run to candidate identity
++        env:
++          DISPATCH_SHA: ${{ inputs.expected_sha }}
++        run: |
++          set -euo pipefail
++          HEAD=$(git rev-parse HEAD)
++          TREE=$(git rev-parse 'HEAD^{tree}')
++          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
++            case "${GITHUB_REF_NAME}" in
++              ci/family-api-codex/*/${GITHUB_SHA}) ;;
++              *) echo "FAIL: CI ref is not task/SHA bound: ${GITHUB_REF_NAME}" >&2; exit 1 ;;
++            esac
++            EXPECTED_SHA=${GITHUB_REF_NAME##*/}
++          else
++            EXPECTED_SHA=${DISPATCH_SHA}
++          fi
++          [ "${HEAD}" = "${GITHUB_SHA}" ]
++          [ "${HEAD}" = "${EXPECTED_SHA}" ]
++          echo "CWF_CI_IDENTITY repo=${GITHUB_REPOSITORY} head=${HEAD} tree=${TREE} branch=${GITHUB_REF_NAME}"
++
++  transportd:
++    needs: identity
++    runs-on: ubuntu-24.04
++    steps:
++      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
++        with:
++          fetch-depth: 0
++          persist-credentials: false
++      - name: Bound linker memory (R3-LINK-001 repeated ld SIGBUS evidence)
++        run: |
++          set -euo pipefail
++          sudo swapoff -a || true
++          sudo rm -f /swapfile
++          sudo fallocate -l 6G /swapfile
++          sudo chmod 600 /swapfile
++          sudo mkswap /swapfile
++          sudo swapon /swapfile
++          sudo mkdir -p /mnt/ci-target
++          sudo chown -R "$(id -un):$(id -gn)" /mnt/ci-target
++          df -h / /mnt
++      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
++        with:
++          toolchain: 1.95.0
++          components: clippy,rustfmt,rust-src
++      - name: Locked transportd build, tests, and lint
++        working-directory: codex-rs
++        run: |
++          set -euo pipefail
++          cargo build --locked -p codex-transportd --release
++          rm -rf "${CARGO_TARGET_DIR}/release"
++          cargo test --locked -p codex-transportd
++          cargo test --locked -p codex-transportd --features test-upstream
++          cargo test --locked -p codex-client --test retry_raw_tests
++          cargo test --locked -p codex-http-client --lib
++          cargo clippy --locked -p codex-transportd --no-deps -- -D warnings
++
++  replay-gates:
++    needs: identity
++    runs-on: ubuntu-24.04
++    steps:
++      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
++        with:
++          fetch-depth: 0
++          persist-credentials: false
++      - name: Bound linker memory (R3-LINK-001 repeated ld SIGBUS evidence)
++        run: |
++          set -euo pipefail
++          sudo swapoff -a || true
++          sudo rm -f /swapfile
++          sudo fallocate -l 6G /swapfile
++          sudo chmod 600 /swapfile
++          sudo mkswap /swapfile
++          sudo swapon /swapfile
++          sudo mkdir -p /mnt/ci-target
++          sudo chown -R "$(id -un):$(id -gn)" /mnt/ci-target
++          df -h / /mnt
++      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
++        with:
++          toolchain: 1.95.0
++      - name: Verify replay, export, evidence, and mutation gates
++        run: |
++          set -euo pipefail
++          bash replay/worker-ci-static-test.sh
++          bash replay/gate.sh
++          bash patches/transportd/tools/export-gate.sh
++          bash patches/transportd/tools/release-evidence-gate.sh
++          bash patches/transportd/tools/ci-gates-static-test.sh
++          bash patches/transportd/tools/static-fix-gates.sh
++          bash patches/transportd/tools/capture-isolation-gate.sh
++          bash patches/transportd/tools/gate-mutation-test.sh
++          bash patches/transportd/tools/gate-export-mutation-test.sh
++          bash patches/transportd/tools/gate-evidence-mutation-test.sh
++          bash patches/transportd/tools/gate-wire-sbom-mutation-test.sh
++
++  platform-policy:
++    needs: identity
++    strategy:
++      fail-fast: false
++      matrix:
++        os: [ubuntu-24.04, macos-15, windows-2025]
++    runs-on: ${{ matrix.os }}
++    steps:
++      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
++        with:
++          persist-credentials: false
++      - name: Verify supported archive policy
++        shell: bash
++        run: bash codex-rs/scripts/check-platform-archives.sh
++
++  results:
++    if: always()
++    needs: [identity, transportd, replay-gates, platform-policy]
++    runs-on: ubuntu-24.04
++    steps:
++      - name: Require every worker CI job
++        env:
++          NEEDS: ${{ toJSON(needs) }}
++        run: |
++          python3 - <<'PY'
++          import json
++          import os
++          import sys
++
++          needs = json.loads(os.environ["NEEDS"])
++          failed = {name: item["result"] for name, item in needs.items() if item["result"] != "success"}
++          if failed:
++              print(f"FAIL: worker CI jobs: {failed}", file=sys.stderr)
++              raise SystemExit(1)
++          print("PASS: all worker CI jobs succeeded")
++          PY
+diff --git a/codex-rs/scripts/check-platform-archives.sh b/codex-rs/scripts/check-platform-archives.sh
+new file mode 100755
+index 000000000..aeaf3cfc9
+--- /dev/null
++++ b/codex-rs/scripts/check-platform-archives.sh
+@@ -0,0 +1,141 @@
++#!/usr/bin/env bash
++# R-PLATFORM-001（replay_0831 R6）：Windows 全 workspace 档案的平台策略
++# gate——可执行、离线、确定性。
++#
++# 断言：
++#   1. codex-transportd 是无条件 workspace 成员；
++#   2. 该 crate 含非 cfg 门控的 Unix-only API（排除有据，不伪装支持）；
++#   3. rust-ci-full-nextest-platform.yml 的 Windows 目标在 nextest 档案中
++#      显式排除 codex-transportd；
++#   4. 排除是条件性的：受支持的 Unix 目标档案不排除（保持完整覆盖）；
++#   5. Windows 排除清单只含被 (2) 证明的 crate。
++#
++# 用法: check-platform-archives.sh    （任何断言失败 → exit 1）
++set -euo pipefail
++
++REPO="$(cd "$(dirname "$0")/../.." && pwd)"
++MANIFEST="$REPO/codex-rs/Cargo.toml"
++WF="$REPO/.github/workflows/rust-ci-full-nextest-platform.yml"
++FULL_WORKFLOW="$REPO/.github/workflows/rust-ci-full.yml"
++ARCHIVE_WORKFLOW="$REPO/.github/workflows/rust-ci-full-nextest-platform.yml"
++CRATE_DIR="$REPO/codex-rs/codex-transportd"
++FAILS=0
++
++ok() { echo "  ok: $1"; }
++bad() {
++  echo "FAIL: $1"
++  FAILS=1
++}
++
++require_file() {
++  [ -f "$1" ] || { echo "FAIL: required archive policy input is missing: $1" >&2; exit 1; }
++}
++
++require_text() {
++  local file="$1"
++  local needle="$2"
++  grep -qF -- "$needle" "$file" || { echo "FAIL: $file is missing: $needle" >&2; exit 1; }
++}
++
++echo "== 平台归档策略 gate（R-PLATFORM-001） =="
++
++# 1. workspace 成员资格无条件。
++if grep -qF '"codex-transportd"' "$MANIFEST"; then
++  ok "codex-transportd 是 workspace 成员"
++else
++  bad "codex-rs/Cargo.toml 缺少 codex-transportd 成员"
++fi
++
++# 2. 排除依据：crate 内非 cfg 门控的 Unix-only API。
++UNIX_MARKERS=0
++if grep -qE '^use tokio::net::UnixListener;' "$CRATE_DIR/src/server/mod.rs"; then
++  ok "server/mod.rs 含无条件 UnixListener import"
++  UNIX_MARKERS=$((UNIX_MARKERS + 1))
++else
++  bad "预期 server/mod.rs 的无条件 UnixListener import 缺失（crate 可能已跨平台，策略需复核）"
++fi
++if grep -qE '^use std::os::fd::' "$CRATE_DIR/src/capture_writer.rs"; then
++  ok "capture_writer.rs 含无条件 Unix fd import"
++  UNIX_MARKERS=$((UNIX_MARKERS + 1))
++else
++  bad "预期 capture_writer.rs 的无条件 Unix fd import 缺失（crate 可能已跨平台，策略需复核）"
++fi
++
++# 3+4. Windows 目标条件性排除；Unix 目标不排除。
++[ -f "$WF" ] || bad "workflow 不存在: $WF"
++if grep -qF 'archive_excludes=()' "$WF"; then
++  ok "档案排除数组存在（默认为空 = Unix 全覆盖）"
++else
++  bad "workflow 缺少 archive_excludes=() 初始化"
++fi
++if grep -qF -- '*-pc-windows-msvc) archive_excludes+=(--exclude codex-transportd) ;;' "$WF"; then
++  ok "Windows 目标显式排除 codex-transportd"
++else
++  bad "workflow 缺少 Windows 分支的 --exclude codex-transportd"
++fi
++if grep -qF "\"\${archive_excludes[@]}\"" "$WF"; then
++  ok "cargo nextest archive 消费排除数组"
++else
++  bad "cargo nextest archive 调用未消费 \"\${archive_excludes[@]}\""
++fi
++
++# 5. 排除清单最小性：--exclude 只允许出现在 Windows case 分支一行。
++EXCLUDE_LINES="$(grep -c -- '--exclude codex-transportd' "$WF" || true)"
++if [ "$EXCLUDE_LINES" -eq 1 ]; then
++  ok "排除只声明一次（无无条件排除、无范围蔓延）"
++else
++  bad "--exclude codex-transportd 出现 $EXCLUDE_LINES 次（必须仅 Windows case 分支 1 次）"
++fi
++
++if [ "$FAILS" -eq 0 ]; then
++  echo "PASS: 平台归档策略（unix-only crate 明确退出 Windows 全 workspace 档案；Unix 检查保持完整）"
++else
++  exit 1
++fi
++
++# Worker CI additionally checks every declared target/artifact and fixed archive wiring.
++require_file "$FULL_WORKFLOW"
++require_file "$ARCHIVE_WORKFLOW"
++
++targets=(
++  aarch64-apple-darwin
++  x86_64-apple-darwin
++  x86_64-unknown-linux-musl
++  x86_64-unknown-linux-gnu
++  aarch64-unknown-linux-musl
++  aarch64-unknown-linux-gnu
++  x86_64-pc-windows-msvc
++  aarch64-pc-windows-msvc
++)
++for target in "${targets[@]}"; do
++  require_text "$FULL_WORKFLOW" "target: $target"
++done
++
++archive_pairs=(
++  'aarch64-apple-darwin|macos-aarch64'
++  'x86_64-unknown-linux-gnu|linux-x64-remote'
++  'aarch64-unknown-linux-gnu|linux-arm64'
++  'x86_64-pc-windows-msvc|windows-x64'
++  'aarch64-pc-windows-msvc|windows-arm64'
++)
++for pair in "${archive_pairs[@]}"; do
++  target="${pair%%|*}"
++  artifact="${pair#*|}"
++  require_text "$FULL_WORKFLOW" "target: $target"
++  require_text "$FULL_WORKFLOW" "artifact_id: $artifact"
++done
++require_text "$FULL_WORKFLOW" 'archive_runner: windows-x64'
++
++require_text "$ARCHIVE_WORKFLOW" "NEXTEST_ARCHIVE_FILE: nextest-\${{ inputs.artifact_id }}.tar.zst"
++require_text "$ARCHIVE_WORKFLOW" "--archive-file \"\${archive_dir}/\${NEXTEST_ARCHIVE_FILE}\""
++require_text "$ARCHIVE_WORKFLOW" "name: nextest-archive-\${{ inputs.artifact_id }}"
++require_text "$ARCHIVE_WORKFLOW" "path: \${{ runner.temp }}/nextest-archive/\${{ env.NEXTEST_ARCHIVE_FILE }}"
++require_text "$ARCHIVE_WORKFLOW" 'Download nextest archive'
++require_text "$ARCHIVE_WORKFLOW" "name: nextest-archive-\${{ inputs.artifact_id }}"
++
++if grep -Eq 'NEXTEST_ARCHIVE_FILE:.*\.(zip|tar\.gz|tgz)([[:space:]]|$)' "$ARCHIVE_WORKFLOW"; then
++  echo 'FAIL: nextest archive policy allows a non-tar.zst archive' >&2
++  exit 1
++fi
++
++echo "PASS: worker archive identity policy (${RUNNER_OS:-${OSTYPE:-unknown}})"
+-- 
+2.48.1
+

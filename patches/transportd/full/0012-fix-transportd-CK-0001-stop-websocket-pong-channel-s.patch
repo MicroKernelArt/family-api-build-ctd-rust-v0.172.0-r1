@@ -1,0 +1,219 @@
+From 63366fb95c446311530717642f57285024888905 Mon Sep 17 00:00:00 2001
+From: Shanks <shanks@book>
+Date: Wed, 9 Sep 2026 00:58:33 +0800
+Subject: [PATCH 12/37] fix(transportd): CK-0001 stop websocket pong-channel
+ spin
+
+(cherry picked from commit b96a968de2257936aed15a90f28ee039c217ee7d)
+---
+ .../codex-transportd/src/server/websocket.rs  | 134 ++++++++++--------
+ .../src/server/websocket_tests.rs             |  16 +++
+ 2 files changed, 89 insertions(+), 61 deletions(-)
+ create mode 100644 codex-rs/codex-transportd/src/server/websocket_tests.rs
+
+diff --git a/codex-rs/codex-transportd/src/server/websocket.rs b/codex-rs/codex-transportd/src/server/websocket.rs
+index 3eab70b6d..d28ef13fb 100644
+--- a/codex-rs/codex-transportd/src/server/websocket.rs
++++ b/codex-rs/codex-transportd/src/server/websocket.rs
+@@ -1,9 +1,9 @@
+ //! UDS WebSocket upgrade 与 1:1 relay（TLS-CTD-001 §12.3 / §11.7）。
+ 
++use axum::extract::State;
+ use axum::extract::ws::Message as AxumWsMessage;
+ use axum::extract::ws::WebSocket;
+ use axum::extract::ws::WebSocketUpgrade;
+-use axum::extract::State;
+ use axum::http::HeaderMap;
+ use axum::response::Response;
+ use futures::StreamExt;
+@@ -11,8 +11,12 @@ use tokio::sync::mpsc;
+ use tokio_tungstenite::tungstenite::Message;
+ 
+ use crate::contract::operation::Operation;
+-use crate::server::local_error_response;
+ use crate::server::ServerState;
++use crate::server::local_error_response;
++
++#[cfg(test)]
++#[path = "websocket_tests.rs"]
++mod tests;
+ 
+ /// WS 并发连接计数（1:1，有界）。
+ static WS_CONNECTION_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+@@ -153,16 +157,14 @@ async fn relay_ws_session(
+     deadline: tokio::time::Instant,
+     _ws_permit: tokio::sync::OwnedSemaphorePermit,
+ ) {
+-    use futures::SinkExt;
+-
+     // 双向两个通道：Go→Rust 帧进入 relay 转发 upstream；
+     // Rust→Go 帧由下游 pump 写回 internal socket（1:1 relay，§11.7）。
+     let (go_to_rust_tx, go_to_rust_rx) = crate::transport::websocket::frame_channels();
+-    let (rust_to_go_tx, mut rust_to_go_rx) = crate::transport::websocket::frame_channels();
++    let (rust_to_go_tx, rust_to_go_rx) = crate::transport::websocket::frame_channels();
+     // downstream Ping → 回 Pong 通道（sink 在 pump2；F-008 不得转发上游）。
+-    let (pong_tx, mut pong_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(4);
++    let (pong_tx, pong_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(4);
+     // 下游不支持帧（Binary）→ 通知 pump2 向客户端发 Close(1003)（review F4）。
+-    let (close_tx, mut close_rx) = tokio::sync::mpsc::channel::<()>(1);
++    let (close_tx, close_rx) = tokio::sync::mpsc::channel::<()>(1);
+     // futures::StreamExt::split：返回 (sink, stream)。
+     let (internal_tx_half, internal_rx_half) = internal.split();
+ 
+@@ -210,60 +212,7 @@ async fn relay_ws_session(
+     };
+ 
+     // pump 2：rust_to_go → internal socket（上游事件下行）+ Pong 回写 + Close 通知。
+-    let relay_to_internal = async move {
+-        let mut internal_tx_half = internal_tx_half;
+-        loop {
+-            tokio::select! {
+-                message = rust_to_go_rx.recv() => {
+-                    let Some(message) = message else { break };
+-                    let out = match message {
+-                        Message::Text(text) => AxumWsMessage::Text(text.to_string().into()),
+-                        Message::Ping(payload) => AxumWsMessage::Ping(payload),
+-                        Message::Pong(payload) => AxumWsMessage::Pong(payload),
+-                        Message::Close(frame) => {
+-                            let _ = internal_tx_half
+-                                .send(AxumWsMessage::Close(frame.map(map_tungstenite_close_to_axum)))
+-                                .await;
+-                            break;
+-                        }
+-                        Message::Binary(_) => {
+-                            // 上游 binary 业务帧 fail closed（§11.7.5）：关闭连接。
+-                            let _ = internal_tx_half
+-                                .send(AxumWsMessage::Close(Some(axum::extract::ws::CloseFrame {
+-                                    code: 1008, // CloseCode::Policy
+-                                    reason: "unsupported upstream frame".into(),
+-                                })))
+-                                .await;
+-                            break;
+-                        }
+-                        Message::Frame(_) => break,
+-                    };
+-                    if internal_tx_half.send(out).await.is_err() {
+-                        break;
+-                    }
+-                }
+-                payload = pong_rx.recv() => {
+-                    let Some(payload) = payload else { continue };
+-                    if internal_tx_half.send(AxumWsMessage::Pong(payload)).await.is_err() {
+-                        break;
+-                    }
+-                }
+-                Some(()) = close_rx.recv() => {
+-                    // RF3（real-lane codexp）：只对显式的 unsupported-Binary 信号发
+-                    // Close(1003)；close_tx 在 pump1 正常退出（Close/EOF/错误）时被
+-                    // drop → recv() 返回 None，此处不匹配 → 走正常 teardown，不再
+-                    // 误发 1003 覆盖对端 close code/reason。
+-                    let _ = internal_tx_half
+-                        .send(AxumWsMessage::Close(Some(axum::extract::ws::CloseFrame {
+-                            code: 1003, // CloseCode::Unsupported
+-                            reason: "unsupported downstream frame".into(),
+-                        })))
+-                        .await;
+-                    break;
+-                }
+-            }
+-        }
+-    };
++    let relay_to_internal = relay_to_internal(internal_tx_half, rust_to_go_rx, pong_rx, close_rx);
+ 
+     // relay：go_to_rust 帧 → upstream；upstream 事件 → rust_to_go。
+     // F-008：token 传入 relay_ws 作为权威取消源——任一方向结束先 cancel，
+@@ -333,6 +282,69 @@ async fn relay_ws_session(
+     // ws_permit 在函数返回（连接结束）时 Drop 释放。
+ }
+ 
++async fn relay_to_internal<S>(
++    mut internal_tx_half: S,
++    mut rust_to_go_rx: mpsc::Receiver<Message>,
++    mut pong_rx: mpsc::Receiver<bytes::Bytes>,
++    mut close_rx: mpsc::Receiver<()>,
++) where
++    S: futures::Sink<AxumWsMessage> + Unpin,
++{
++    use futures::SinkExt;
++
++    loop {
++        tokio::select! {
++            message = rust_to_go_rx.recv() => {
++                let Some(message) = message else { break };
++                let out = match message {
++                    Message::Text(text) => AxumWsMessage::Text(text.to_string().into()),
++                    Message::Ping(payload) => AxumWsMessage::Ping(payload),
++                    Message::Pong(payload) => AxumWsMessage::Pong(payload),
++                    Message::Close(frame) => {
++                        let _ = internal_tx_half
++                            .send(AxumWsMessage::Close(frame.map(map_tungstenite_close_to_axum)))
++                            .await;
++                        break;
++                    }
++                    Message::Binary(_) => {
++                        // 上游 binary 业务帧 fail closed（§11.7.5）：关闭连接。
++                        let _ = internal_tx_half
++                            .send(AxumWsMessage::Close(Some(axum::extract::ws::CloseFrame {
++                                code: 1008, // CloseCode::Policy
++                                reason: "unsupported upstream frame".into(),
++                            })))
++                            .await;
++                        break;
++                    }
++                    Message::Frame(_) => break,
++                };
++                if internal_tx_half.send(out).await.is_err() {
++                    break;
++                }
++            }
++            payload = pong_rx.recv() => {
++                let Some(payload) = payload else { break };
++                if internal_tx_half.send(AxumWsMessage::Pong(payload)).await.is_err() {
++                    break;
++                }
++            }
++            Some(()) = close_rx.recv() => {
++                // RF3（real-lane codexp）：只对显式的 unsupported-Binary 信号发
++                // Close(1003)；close_tx 在 pump1 正常退出（Close/EOF/错误）时被
++                // drop → recv() 返回 None，此处不匹配 → 走正常 teardown，不再
++                // 误发 1003 覆盖对端 close code/reason。
++                let _ = internal_tx_half
++                    .send(AxumWsMessage::Close(Some(axum::extract::ws::CloseFrame {
++                        code: 1003, // CloseCode::Unsupported
++                        reason: "unsupported downstream frame".into(),
++                    })))
++                    .await;
++                break;
++            }
++        }
++    }
++}
++
+ #[allow(dead_code)]
+ fn _mpsc_probe(_tx: mpsc::Sender<Message>) {}
+ 
+diff --git a/codex-rs/codex-transportd/src/server/websocket_tests.rs b/codex-rs/codex-transportd/src/server/websocket_tests.rs
+new file mode 100644
+index 000000000..7cf5ed0c6
+--- /dev/null
++++ b/codex-rs/codex-transportd/src/server/websocket_tests.rs
+@@ -0,0 +1,16 @@
++use std::time::Duration;
++
++#[tokio::test]
++async fn pump2_exits_when_pong_channel_closes() {
++    let (_rust_to_go_tx, rust_to_go_rx) = crate::transport::websocket::frame_channels();
++    let (pong_tx, pong_rx) = tokio::sync::mpsc::channel(1);
++    let (_close_tx, close_rx) = tokio::sync::mpsc::channel(1);
++    drop(pong_tx);
++
++    tokio::time::timeout(
++        Duration::from_millis(100),
++        super::relay_to_internal(futures::sink::drain(), rust_to_go_rx, pong_rx, close_rx),
++    )
++    .await
++    .expect("pump2 should exit when its pong channel closes");
++}
+-- 
+2.48.1
+
