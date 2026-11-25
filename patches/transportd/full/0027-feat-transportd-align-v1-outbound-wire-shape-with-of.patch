@@ -1,0 +1,1123 @@
+From 9fb7c60f2915c319a6462f02f73b0f927ff53d3e Mon Sep 17 00:00:00 2001
+From: Shanks <shanks@book>
+Date: Thu, 1 Oct 2026 20:40:20 +0800
+Subject: [PATCH 27/37] feat(transportd): align v1 outbound wire shape with
+ official 0.159.2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+v1（hookpoint=v1，ctd 自建请求）修复 docs/22 §6 的 4 类构造差异；v3 路径
+（responses_v3.rs / RequestBody::Raw / X-CTD-Outbound-Headers）零改动。
+
+① 头名序列：v1 自派生头改按官方**确定性构造序**组装
+   （responses.rs `V1_METADATA_HEADER_ORDER`），不再走 BTreeMap 字母序；
+   `originator` / `user-agent` 交回官方位置——它们由 reqwest client 默认头
+   承载，落在 auth 之后、传输头之前（新增 `TrailingHeaderAuth` 复用同一注入
+   点，语义与 reqwest 一致：仅当目标头缺失时写入）。
+② body `client_metadata`：补官方 9 键中缺失的 4 键
+   （metadata.rs `inject_derived_client_metadata`）
+   - `turn_id` / `root_turn_id`：由承载 `x-codex-turn-metadata` 派生（官方 I7 同源）
+   - `guardian_credits_requested`：官方谓词（core/src/client.rs `set_guardian_metadata`）
+     在 v1 会话模型上的投影（ChatGPT 凭据 + codex 后端）
+   - `mcp_attribution`：官方「无 MCP 归因」形态常量（sidecar 与 Go 均无该状态）
+⑤ `content-encoding: zstd`：v1 由 `Compression::None` 改为 `Compression::Zstd`，
+   真压缩（zstd level 3，magic 28b52ffd），头与体由同一权威写入，
+   `content-length` 随压缩后字节数
+⑥ UA 形状：`canonical_user_agent` 归一客户端段版本与官方尾后缀
+   `(<client>; <ver>)`（`originator == codex_cli_rs` 时无后缀，复现官方
+   app-server 形态）；版本段与 `version` 头共用单一来源 `codex_version()`
+
+验证：cargo check -p codex-transportd --all-targets 干净；
+cargo test -p codex-transportd --lib 183 passed（基线 174，+9 新测试）；
+--features test-upstream 下 capture_upstream_contract 4 passed，其中
+`v1_outbound_matches_official_1592_wire_shape` 在 mock 上游逐位断言 18 头
+官方序列 + zstd 体 + 9 键 client_metadata。T3 红线测试的 body 断言随
+⑤ 更新为「解压后核对」。
+---
+ codex-rs/Cargo.lock                           |   1 +
+ codex-rs/codex-transportd/Cargo.toml          |   2 +
+ .../src/transport/metadata.rs                 | 162 +++++++++++
+ .../src/transport/official_adapter.rs         | 212 +++++++++++++-
+ .../src/transport/responses.rs                | 264 +++++++++++++++++-
+ .../src/transport/responses_v3.rs             |   2 +-
+ .../tests/capture_upstream_contract.rs        | 261 ++++++++++++++++-
+ 7 files changed, 886 insertions(+), 18 deletions(-)
+
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+index 2b8d88d53..c5db2b91b 100644
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -4768,6 +4768,7 @@ dependencies = [
+  "tracing-subscriber",
+  "url",
+  "uuid",
++ "zstd",
+ ]
+ 
+ [[package]]
+diff --git a/codex-rs/codex-transportd/Cargo.toml b/codex-rs/codex-transportd/Cargo.toml
+index 1e053ca70..ec572f28a 100644
+--- a/codex-rs/codex-transportd/Cargo.toml
++++ b/codex-rs/codex-transportd/Cargo.toml
+@@ -54,6 +54,8 @@ url = { workspace = true }
+ [dev-dependencies]
+ tempfile = { workspace = true }
+ uuid = { workspace = true }
++# 出站 body 现为 zstd 压缩体（官方形态）；出站契约测试必须能解压核对。
++zstd = { workspace = true }
+ 
+ [build-dependencies]
+ sha2 = "0.10"
+diff --git a/codex-rs/codex-transportd/src/transport/metadata.rs b/codex-rs/codex-transportd/src/transport/metadata.rs
+index e0c9a6bf2..406bab294 100644
+--- a/codex-rs/codex-transportd/src/transport/metadata.rs
++++ b/codex-rs/codex-transportd/src/transport/metadata.rs
+@@ -239,6 +239,72 @@ pub fn inject_carried_turn_metadata(
+     );
+ }
+ 
++/// 官方 `client_metadata` 中承载通道**无权交付**（[`RESERVED_METADATA_KEYS`]
++/// 拒绝）而官方必发的键名。
++pub const TURN_ID_KEY: &str = "turn_id";
++pub const ROOT_TURN_ID_KEY: &str = "root_turn_id";
++pub const GUARDIAN_CREDITS_REQUESTED_KEY: &str = "guardian_credits_requested";
++pub const MCP_ATTRIBUTION_KEY: &str = "mcp_attribution";
++
++/// 官方「无 MCP 归因」的序列化常量
++/// （`codex_protocol::mcp::McpAttribution::default()`，
++/// `protocol/src/mcp.rs:67-72,115-126`：`status = none`，`sources` 为空且
++/// `skip_serializing_if` ⇒ 只剩 `{"status":"none"}`；`docs/21 §5.3` 实测同值）。
++pub const MCP_ATTRIBUTION_NONE: &str = r#"{"status":"none"}"#;
++
++/// 补齐官方 `client_metadata` 中由 ctd 派生、承载通道无权交付的 4 个键
++/// （`docs/22 §6` 项 #8/#10/#12/#14/#16）。
++///
++/// 各键的真值来源：
++/// - `turn_id` / `root_turn_id`：**派生**。官方 I7 要求它们与请求头
++///   `x-codex-turn-metadata` 同源（`docs/21 §6`）；承载的 turn-metadata 就是
++///   该权威值（`inject_carried_turn_metadata` 已写入 canonical 位），此处直接
++///   取其中同名字段。缺失该头（或其中不含对应键，如 `request_kind=prewarm`）
++///   ⇒ 不补，保持与官方「无该字段就不发」一致。
++/// - `guardian_credits_requested`：**派生**。官方谓词
++///   （`core/src/client.rs:1126-1158` `set_guardian_metadata`）为
++///   「非 guardian reviewer ∧ 非 basic session source ∧ ChatGPT 凭据 ∧
++///   codex 后端 ∧ provider 支持 codex 后端路由」。v1 下 provider 恒为
++///   chatgpt codex base（`CHATGPT_CODEX_BASE_URL`），auth 恒为
++///   Bearer + ChatGPT-Account-ID，guardian reviewer 标记头
++///   （`x-codex-guardian`）不在承载白名单内 ⇒ 恒 false ⇒ 谓词收敛为
++///   「是否 ChatGPT 账号凭据」。
++/// - `mcp_attribution`：**常量近似**。官方值是客户端会话的累积 MCP 归因，
++///   sidecar 侧无该状态（Go 侧同样无，`docs/19 §17`）⇒ 按官方「无 MCP 结果」
++///   形态写入。★ 已登记的近似：若客户端本次会话用过 MCP，该键会与真实归因
++///   不符（该键 body-only、model-invisible）。
++pub fn inject_derived_client_metadata(
++    obj: &mut Map<String, Value>,
++    ctx: &crate::contract::RequestContext,
++) {
++    let Some(Value::Object(metadata)) = obj.get_mut("client_metadata") else {
++        return;
++    };
++    let turn_metadata = metadata
++        .get(TURN_METADATA_CLIENT_METADATA_KEY)
++        .and_then(Value::as_str)
++        .map(str::to_owned);
++    if let Some(raw) = turn_metadata
++        && let Ok(Value::Object(turn_metadata)) = serde_json::from_str::<Value>(&raw)
++    {
++        for key in [TURN_ID_KEY, ROOT_TURN_ID_KEY] {
++            if let Some(value @ Value::String(_)) = turn_metadata.get(key) {
++                metadata.insert(key.to_string(), value.clone());
++            }
++        }
++    }
++    if ctx.chatgpt_account_id.is_some() {
++        metadata.insert(
++            GUARDIAN_CREDITS_REQUESTED_KEY.to_string(),
++            Value::String("true".to_string()),
++        );
++    }
++    metadata.insert(
++        MCP_ATTRIBUTION_KEY.to_string(),
++        Value::String(MCP_ATTRIBUTION_NONE.to_string()),
++    );
++}
++
+ /// 构造官方 metadata 投影（UUIDv7 校验在入口完成）。
+ pub fn build_projection(
+     installation_id: &str,
+@@ -358,6 +424,102 @@ mod tests {
+         assert_eq!(metadata.get("session_id").unwrap(), "s");
+         assert_eq!(metadata.get("custom").unwrap(), "x");
+     }
++
++    /// 官方 exec 0.159.2 首条 POST 的 `client_metadata` 键集合
++    /// （`baseline/official-1592.json:body.client_metadata_keys`）。
++    const OFFICIAL_CLIENT_METADATA_KEYS: [&str; 9] = [
++        "guardian_credits_requested",
++        "mcp_attribution",
++        "root_turn_id",
++        "session_id",
++        "thread_id",
++        "turn_id",
++        "x-codex-installation-id",
++        "x-codex-turn-metadata",
++        "x-codex-window-id",
++    ];
++
++    fn derived_fixture_ctx(chatgpt: bool) -> crate::contract::RequestContext {
++        crate::contract::RequestContext {
++            chatgpt_account_id: chatgpt
++                .then(|| crate::redaction::SecretString::new("acc-1")),
++            ..Default::default()
++        }
++    }
++
++    /// 复刻 `execute_responses_raw` 的 body 组装链（投影 → 承载 turn-metadata
++    /// → 派生键），断言键集合与官方 9 键逐字相等。
++    fn assembled_client_metadata(
++        carried: &std::collections::BTreeMap<String, String>,
++        chatgpt: bool,
++    ) -> Value {
++        let session = crate::contract::headers::SessionSnapshot {
++            session_id: "0198f2b0-0000-7000-8000-000000000001".to_string(),
++            thread_id: "0198f2b0-0000-7000-8000-000000000002".to_string(),
++            window_id: "0198f2b0-0000-7000-8000-000000000002:1".to_string(),
++        };
++        let projection = build_projection("installation-1", &session).expect("projection");
++        let mut obj = serde_json::Map::new();
++        obj.insert("model".into(), Value::String("gpt-5.6-sol".into()));
++        inject_official_client_metadata(
++            &mut obj,
++            Vec::new(),
++            projection.client_metadata(/*include_internal*/ true),
++        );
++        inject_carried_turn_metadata(&mut obj, carried);
++        inject_derived_client_metadata(&mut obj, &derived_fixture_ctx(chatgpt));
++        obj.get("client_metadata").cloned().expect("client_metadata")
++    }
++
++    #[test]
++    fn derived_keys_complete_official_client_metadata_key_set() {
++        let carried = std::collections::BTreeMap::from([(
++            TURN_METADATA_CLIENT_METADATA_KEY.to_string(),
++            r#"{"request_kind":"turn","turn_id":"0198f2b0-0000-7000-8000-000000000003","root_turn_id":"0198f2b0-0000-7000-8000-000000000003","session_id":"0198f2b0-0000-7000-8000-000000000001"}"#
++                .to_string(),
++        )]);
++        let metadata = assembled_client_metadata(&carried, /*chatgpt*/ true);
++        let mut keys: Vec<&str> = metadata.as_object().unwrap().keys().map(String::as_str).collect();
++        keys.sort_unstable();
++        let mut expected = OFFICIAL_CLIENT_METADATA_KEYS.to_vec();
++        expected.sort_unstable();
++        assert_eq!(keys, expected);
++        assert_eq!(metadata["guardian_credits_requested"], "true");
++        assert_eq!(metadata["mcp_attribution"], r#"{"status":"none"}"#);
++        assert_eq!(metadata["turn_id"], "0198f2b0-0000-7000-8000-000000000003");
++        assert_eq!(
++            metadata["root_turn_id"],
++            "0198f2b0-0000-7000-8000-000000000003"
++        );
++    }
++
++    #[test]
++    fn turn_ids_are_derived_from_the_carried_turn_metadata() {
++        // 官方 I7：`client_metadata.{turn_id,root_turn_id}` 必须与请求头
++        // `x-codex-turn-metadata` 同源（docs/21 §6）。
++        let carried = std::collections::BTreeMap::from([(
++            TURN_METADATA_CLIENT_METADATA_KEY.to_string(),
++            r#"{"request_kind":"turn","turn_id":"turn-a","root_turn_id":"root-a"}"#.to_string(),
++        )]);
++        let metadata = assembled_client_metadata(&carried, true);
++        assert_eq!(metadata["turn_id"], "turn-a");
++        assert_eq!(metadata["root_turn_id"], "root-a");
++
++        // 无承载 turn-metadata（或其中不含该字段，如 prewarm）⇒ 不补，
++        // 与官方「无该字段就不发」一致。
++        let metadata = assembled_client_metadata(&Default::default(), true);
++        assert!(metadata.get("turn_id").is_none());
++        assert!(metadata.get("root_turn_id").is_none());
++    }
++
++    #[test]
++    fn guardian_credits_follows_the_official_chatgpt_auth_predicate() {
++        // 官方 `set_guardian_metadata` 要求 ChatGPT 凭据（core/src/client.rs:1126-1158）。
++        let chatgpt = assembled_client_metadata(&Default::default(), /*chatgpt*/ true);
++        assert_eq!(chatgpt["guardian_credits_requested"], "true");
++        let api_key = assembled_client_metadata(&Default::default(), /*chatgpt*/ false);
++        assert!(api_key.get("guardian_credits_requested").is_none());
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/codex-rs/codex-transportd/src/transport/official_adapter.rs b/codex-rs/codex-transportd/src/transport/official_adapter.rs
+index cf849838b..2442a4aeb 100644
+--- a/codex-rs/codex-transportd/src/transport/official_adapter.rs
++++ b/codex-rs/codex-transportd/src/transport/official_adapter.rs
+@@ -22,6 +22,8 @@ use codex_http_client::build_reqwest_client_for_explicit_route;
+ use codex_http_client::with_chatgpt_cloudflare_cookie_store;
+ use codex_model_provider::BearerAuthProvider;
+ use http::HeaderMap;
++use http::HeaderValue;
++use http::header::Entry;
+ 
+ use crate::contract::ProxyKind;
+ use crate::contract::error::ErrorClass;
+@@ -115,10 +117,20 @@ pub fn wham_provider() -> Provider {
+     }
+ }
+ 
++/// ctd 出站 `version` 与 UA 版本段的**单一来源**。
++///
++/// `version` 请求头（[`official_version_header`]）与 `user-agent` 的
++/// 客户端段/尾后缀（[`canonical_user_agent`]）都必须读它，禁止各自写字面量
++/// 或各自读 `env!`——否则「头说 0.159.2、UA 说 0.159.0」这类同源漂移会重现
++/// （`docs/22 §6` 项 #4）。
++pub fn codex_version() -> &'static str {
++    env!("CARGO_PKG_VERSION")
++}
++
+ /// 官方 `version` header（与 `create_openai_provider` 相同）。
+ fn official_version_header() -> HeaderMap {
+     let mut headers = HeaderMap::new();
+-    if let Ok(value) = http::HeaderValue::from_str(env!("CARGO_PKG_VERSION")) {
++    if let Ok(value) = http::HeaderValue::from_str(codex_version()) {
+         headers.insert("version", value);
+     }
+     headers
+@@ -217,6 +229,130 @@ pub fn official_auth(ctx: &crate::contract::RequestContext) -> SharedAuthProvide
+     })
+ }
+ 
++/// v1 专用 auth 装饰器：在内层 auth 之后，按官方位置注入
++/// `originator` / `user-agent`。
++///
++/// ★ 为什么不能当普通请求头注入：官方把这两个头交给 **`reqwest::Client`
++/// 默认头**承载，reqwest 在 `execute_request` 里对默认头做
++/// 「按序插入、**不覆盖**已存在的同名头」
++/// （`reqwest-0.12.28/src/async_impl/client.rs:2591-2597`），因此它们落在
++/// `authorization` / `chatgpt-account-id` **之后**、`host` / `content-length`
++/// **之前**（官方 0.159.2 出站序列第 15/16 位）。v1 的承载通道把这两个值
++/// 交给 ctd，若在 `extra_headers` 阶段注入就会落到 auth 之前，头序立刻偏离
++/// 官方。这里复用官方**同一个注入点**复刻该位置，语义与 reqwest 默认头逐字
++/// 一致：仅当目标头不存在时写入。
++///
++/// 作用域：只有 v1 responses 路径构造它（[`official_auth`] 本身不变），
++/// v3 与其它 operation 的头集/头序不受影响。
++pub struct TrailingHeaderAuth {
++    inner: SharedAuthProvider,
++    trailing: HeaderMap,
++}
++
++impl codex_api::AuthProvider for TrailingHeaderAuth {
++    fn add_auth_headers(&self, headers: &mut HeaderMap) {
++        // 遥测（`codex_api::auth_header_telemetry`）必须看到与出站一致的 auth 头。
++        self.inner.add_auth_headers(headers);
++    }
++
++    fn apply_auth(&self, request: codex_client::Request) -> codex_api::AuthProviderFuture<'_> {
++        Box::pin(async move {
++            let mut request = self.inner.apply_auth(request).await?;
++            for (name, value) in self.trailing.iter() {
++                if let Entry::Vacant(entry) = request.headers.entry(name) {
++                    entry.insert(value.clone());
++                }
++            }
++            Ok(request)
++        })
++    }
++}
++
++/// 内层官方 auth + 官方位置的尾段头（v1 responses 专用）。
++pub fn official_auth_with_trailing_headers(
++    ctx: &crate::contract::RequestContext,
++    trailing: HeaderMap,
++) -> SharedAuthProvider {
++    Arc::new(TrailingHeaderAuth {
++        inner: official_auth(ctx),
++        trailing,
++    })
++}
++
++/// 官方 UA 形态（`docs/21 §3.1` 第 16 行）：
++/// `<client>/<ver> (<OS> <osver>; <arch>) <TERM-program>/<ver>[ (<client>; <ver>)]`
++///
++/// 两条官方规则被复刻：
++/// 1. **版本段一律取 [`codex_version`]**（与 `version` 请求头同源）——
++///    承载通道带来的是客户端自报版本（如 `0.159.0`），与 `version` 头不同源；
++/// 2. **尾后缀 `(<client>; <ver>)` 的 client 段 == `originator`**。官方后缀
++///    由 `USER_AGENT_SUFFIX` 产生，来源是客户端自报名
++///    （`app-server/src/request_processors/initialize_processor.rs:130`
++///    `format!("{name}; {version}")`），且**仅当该名不在
++///    `NON_ORIGINATING_CLIENT_NAMES`（`codex_app_server_daemon` / `codex-backend`）
++///    内**才设置；此时 `originator` 也等于该名。可观测等价判据：
++///    `originator == DEFAULT_ORIGINATOR`（`codex_cli_rs`，即「无客户端自报名」）
++///    ⇒ 无尾后缀；否则有。该判据同时复现 exec / TUI / app-server 三形态实测
++///    （`docs/21 §0.0`：exec 有、TUI 有、app-server 无）。
++///
++/// 平台段与终端段**保持承载值原样**——官方口径下它们随环境变（`docs/21 §7.2`），
++/// 不是可比性缺陷。
++///
++/// `raw` 缺失时退回官方 generator [`codex_login::default_client::get_codex_user_agent`]，
++/// 使「承载了 originator 但没承载 UA」时客户端段与后缀仍与 originator 自洽。
++pub fn canonical_user_agent(raw: Option<HeaderValue>, originator: Option<&str>) -> String {
++    let version = codex_version();
++    let base = match raw.as_ref().and_then(|value| value.to_str().ok()) {
++        Some(raw) => raw.to_string(),
++        None => codex_login::default_client::get_codex_user_agent(),
++    };
++    let base = strip_user_agent_suffix(&base);
++    let ua_client = base
++        .split('/')
++        .next()
++        .unwrap_or(base)
++        .trim()
++        .to_string();
++    let client = originator
++        .map(str::trim)
++        .filter(|value| !value.is_empty())
++        .unwrap_or(ua_client.as_str());
++    // 版本段之后的原文（平台段 + 终端段）；缺失则整段省略。
++    let rest = base
++        .split_once('/')
++        .and_then(|(_, tail)| tail.split_once(' '))
++        .map(|(_, rest)| rest.trim())
++        .unwrap_or("");
++    let suffix = if client == codex_login::default_client::DEFAULT_ORIGINATOR {
++        String::new()
++    } else {
++        format!(" ({client}; {version})")
++    };
++    if rest.is_empty() {
++        format!("{client}/{version}{suffix}")
++    } else {
++        format!("{client}/{version} {rest}{suffix}")
++    }
++}
++
++/// 去掉官方形态的尾后缀 `(<client>; <ver>)`（幂等：承载值已带后缀时不重复叠加）。
++///
++/// 只认「最后一个空格分隔组以 `(` 开头、以 `)` 结尾、内容含 `; `」**且不是**
++/// 紧跟版本段的 `(<OS> <osver>; <arch>)` 组——后者正是平台段，绝不能剥。
++fn strip_user_agent_suffix(user_agent: &str) -> &str {
++    let user_agent = user_agent.trim();
++    let Some(first_space) = user_agent.find(' ') else {
++        return user_agent;
++    };
++    let Some(open) = user_agent.rfind(" (") else {
++        return user_agent;
++    };
++    if open == first_space || !user_agent.ends_with(')') || !user_agent[open + 1..].contains("; ") {
++        return user_agent;
++    }
++    user_agent[..open].trim_end()
++}
++
+ /// ReqwestTransport 包装（复用池化 client）。
+ pub fn transport_for(client: reqwest::Client) -> ReqwestTransport {
+     ReqwestTransport::new(client)
+@@ -292,6 +428,80 @@ mod tests {
+         assert_eq!(merged.get("version").unwrap(), "0.159.2");
+     }
+ 
++    /// `version` 请求头的实际出站值——UA 版本段必须与它同源。
++    fn outbound_version_header() -> String {
++        official_version_header()
++            .get("version")
++            .expect("version header")
++            .to_str()
++            .expect("ascii")
++            .to_string()
++    }
++
++    #[test]
++    fn user_agent_takes_official_tui_shape() {
++        // ⑥ 参照官方 TUI 形态（baseline `reference_paths.secondary`）：承载值
++        // 的客户端段版本（0.159.0）与尾后缀都要归一，平台/终端段保持环境原样。
++        let version = outbound_version_header();
++        let carried = HeaderValue::from_static(
++            "codex-tui/0.159.0 (Ubuntu 22.4.0; x86_64) xterm-256color",
++        );
++        assert_eq!(
++            canonical_user_agent(Some(carried), Some("codex-tui")),
++            format!("codex-tui/{version} (Ubuntu 22.4.0; x86_64) xterm-256color (codex-tui; {version})")
++        );
++    }
++
++    #[test]
++    fn user_agent_client_segment_and_suffix_share_one_source() {
++        // 客户端段版本与尾后缀版本必须同源于 `version` 请求头——这正是
++        // docs/22 §6 项 #4「版本段 0.159.0 vs 官方 0.159.2」的成因。
++        let version = outbound_version_header();
++        let carried =
++            HeaderValue::from_static("codex_exec/0.150.0 (Mac OS 15.5.0; arm64) WarpTerminal/v1");
++        let user_agent = canonical_user_agent(Some(carried), Some("codex_exec"));
++        assert!(
++            user_agent.starts_with(&format!("codex_exec/{version} ")),
++            "客户端段版本未与 version 头同源: {user_agent}"
++        );
++        assert!(
++            user_agent.ends_with(&format!("(codex_exec; {version})")),
++            "尾后缀版本未与 version 头同源: {user_agent}"
++        );
++    }
++
++    #[test]
++    fn user_agent_omits_suffix_for_default_originator() {
++        // 官方 app-server 形态（clientInfo.name 命中 NON_ORIGINATING_CLIENT_NAMES）
++        // 的 originator 保持默认值 ⇒ 官方 UA **无**尾后缀（docs/21 §0.0）。
++        let carried = HeaderValue::from_static(
++            "codex_cli_rs/0.150.0 (Mac OS 15.5.0; arm64) WarpTerminal/v1",
++        );
++        assert_eq!(
++            canonical_user_agent(Some(carried), Some("codex_cli_rs")),
++            format!(
++                "codex_cli_rs/{} (Mac OS 15.5.0; arm64) WarpTerminal/v1",
++                outbound_version_header()
++            )
++        );
++    }
++
++    #[test]
++    fn user_agent_suffix_strip_is_idempotent() {
++        // 承载值已带官方尾后缀时不重复叠加；平台段（紧跟版本段的括号组）绝不能被剥。
++        let already = HeaderValue::from_static(
++            "codex_exec/0.150.0 (Mac OS 15.5.0; arm64) WarpTerminal/v1 (codex_exec; 0.150.0)",
++        );
++        let once = canonical_user_agent(Some(already), Some("codex_exec"));
++        let twice = canonical_user_agent(
++            Some(HeaderValue::from_str(&once).expect("valid header")),
++            Some("codex_exec"),
++        );
++        assert_eq!(once, twice);
++        assert!(once.contains("(Mac OS 15.5.0; arm64)"), "平台段被误剥: {once}");
++        assert_eq!(once.matches(" (codex_exec; ").count(), 1);
++    }
++
+     #[test]
+     fn version_header_comes_from_package_version() {
+         let headers = official_version_header();
+diff --git a/codex-rs/codex-transportd/src/transport/responses.rs b/codex-rs/codex-transportd/src/transport/responses.rs
+index 6c7f77dd3..1b050c2c9 100644
+--- a/codex-rs/codex-transportd/src/transport/responses.rs
++++ b/codex-rs/codex-transportd/src/transport/responses.rs
+@@ -3,6 +3,8 @@
+ //! 复用官方 `ResponsesClient::stream_raw`（fork patch），返回上游
+ //! status/headers/byte stream；SSE 不 parse 再重组，不全量缓冲。
+ 
++use std::collections::BTreeMap;
++
+ use bytes::Bytes;
+ use futures::StreamExt;
+ use http::HeaderMap;
+@@ -51,6 +53,103 @@ pub fn compatibility_headers(projection: &codex_core::CodexResponsesMetadata) ->
+     headers
+ }
+ 
++/// v1 出站「ctd 自派生元数据头」的**官方确定性构造序**。
++///
++/// 官方 0.159.2 的 HTTP POST 头序列是**强不变量**（5 组采集 × 90 条 POST
++/// 零变异，`docs/21 §0.3`）：
++/// `version` → **本表 8 头** → `accept` → `content-encoding` → `content-type`
++/// → `authorization` → `chatgpt-account-id` → `originator` → `user-agent`
++/// → `host` → `content-length`。
++///
++/// 该序列直接来自官方的插入序：`Provider::build_request`（provider 头）→
++/// `EndpointSession::make_request` 的 `headers.extend(extra_headers)` →
++/// `configure` 闭包（`accept`）→ 压缩路径（`content-encoding` /
++/// `content-type`）→ `auth.apply_auth`（凭据）→ reqwest client 默认头
++/// （`originator` / `user-agent`）→ hyper 传输头（`host` / `content-length`）。
++///
++/// ★ 本表必须按官方构造序写死：改用 `BTreeMap` / `HashMap` 迭代序会得到
++/// **字母序**，那是 `docs/22 §2` 实测的旧 v1 头序，与官方不符。
++///
++/// 不在本表的头由各自权威按同一顺序承载：`version` = provider，
++/// `originator` / `user-agent` = [`V1_TRAILING_HEADER_ORDER`]，
++/// `accept` / `content-encoding` / `content-type` = `configure` 与压缩路径，
++/// `authorization` / `chatgpt-account-id` = auth，`host` / `content-length`
++/// = 传输栈。
++pub const V1_METADATA_HEADER_ORDER: &[&str] = &[
++    "x-codex-beta-features",
++    "x-codex-window-id",
++    "x-codex-turn-metadata",
++    "x-openai-internal-codex-responses-lite",
++    "x-codex-routing-hint",
++    "x-client-request-id",
++    "session-id",
++    "thread-id",
++];
++
++/// 官方交由 **reqwest client 默认头**承载的两个头，位置在 auth 之后、传输头
++/// 之前（官方序列第 15/16 位）。v1 由承载通道拿到它们，必须复用同一注入点
++/// （[`official_adapter::official_auth_with_trailing_headers`]）才能落在官方位置。
++pub const V1_TRAILING_HEADER_ORDER: &[&str] = &["originator", "user-agent"];
++
++/// v1 出站头投影：按官方构造序组装「ctd 自派生」段，并把官方由 client 默认头
++/// 承载的 [`V1_TRAILING_HEADER_ORDER`] 单独交出。
++///
++/// 值来源与优先级与旧实现逐字等价（投影/会话快照 < 承载通道）：
++/// `session-id` / `thread-id` 来自会话快照，`x-codex-window-id` /
++/// `x-codex-turn-metadata` 来自官方投影，其余来自承载通道；承载值覆盖同名的
++/// 本地派生值（`HeaderMap::insert` 的替换语义）。
++///
++/// 未列入两张表的头（如 `openai-beta`）按**确定性键序**追加在自派生段之后——
++/// 官方 HTTP POST 不发这些头（`docs/20 §3.2`），此处只保证「不丢、不乱序」。
++pub fn outbound_headers(
++    ctx: &RequestContext,
++    projection: &codex_core::CodexResponsesMetadata,
++) -> (HeaderMap, HeaderMap) {
++    let mut merged: BTreeMap<String, HeaderValue> = BTreeMap::new();
++    for source in [
++        session_headers(ctx),
++        compatibility_headers(projection),
++        ctx.carried_header_map(),
++    ] {
++        for (name, value) in source.iter() {
++            merged.insert(name.as_str().to_string(), value.clone());
++        }
++    }
++
++    let mut headers = HeaderMap::new();
++    for name in V1_METADATA_HEADER_ORDER {
++        if let Some(value) = merged.remove(*name) {
++            headers.insert(http::header::HeaderName::from_static(name), value);
++        }
++    }
++
++    // `originator` / `user-agent`：官方位置在 auth 之后 ⇒ 交给尾段注入点。
++    // UA 形状在此归一（版本段取单一来源、按 originator 补官方尾后缀）。
++    let originator = merged.remove("originator");
++    let originator_str = originator
++        .as_ref()
++        .and_then(|value| value.to_str().ok())
++        .map(str::to_owned);
++    let user_agent = official_adapter::canonical_user_agent(
++        merged.remove("user-agent"),
++        originator_str.as_deref(),
++    );
++    let mut trailing = HeaderMap::new();
++    if let Some(value) = originator {
++        trailing.insert(http::header::HeaderName::from_static("originator"), value);
++    }
++    if let Ok(value) = HeaderValue::from_str(&user_agent) {
++        trailing.insert(http::header::USER_AGENT, value);
++    }
++
++    for (name, value) in merged {
++        if let Ok(name) = http::header::HeaderName::from_bytes(name.as_bytes()) {
++            headers.insert(name, value);
++        }
++    }
++    (headers, trailing)
++}
++
+ /// 执行 Responses HTTP/SSE 原始请求。
+ pub async fn execute_responses_raw(
+     pool: &crate::transport::client_pool::ClientPool,
+@@ -113,17 +212,19 @@ pub async fn execute_responses_raw(
+     // canonical 位对齐：官方 HTTP 把 turn-metadata 同时放在 body client_metadata
+     // 与 compatibility header；projection 由 snapshot 合成拿不到该值，用承载值补。
+     metadata::inject_carried_turn_metadata(&mut obj, &ctx.carried_headers);
++    // 官方 `client_metadata` 中承载通道**无权交付**（reserved）而官方必发的键：
++    // `turn_id` / `root_turn_id`（由承载的 turn-metadata 派生）+
++    // `guardian_credits_requested` / `mcp_attribution`（由 ctd 的会话模型派生）。
++    metadata::inject_derived_client_metadata(&mut obj, ctx);
+ 
+-    // 3. extra headers（空白 HeaderMap 起步；originator/UA 由 client 默认头提供）。
+-    let mut headers = session_headers(ctx);
+-    headers.extend(compatibility_headers(&projection));
+-    // 承载头（FR-004 唯一 header 通道）：Go 侧已按账号身份 scope 完成的
+-    // 官方 x-codex-* 元数据原样注入并覆盖本地投影，使 rust_sidecar 出站
+-    // 与 R-Go 直连逐头一致。凭据头（authorization / chatgpt-account-id /
+-    // cookie）在解析期已 fail closed，不在承载集合内；本地必需头
+-    // （host/content-length/accept/content-type）与 authorization /
+-    // chatgpt-account-id 仍由官方 client 与 BearerAuthProvider 自写。
+-    headers.extend(ctx.carried_header_map());
++    // 3. extra headers：按官方**确定性构造序**组装（不是字母序）。
++    //    `originator` / `user-agent` 由官方 client 默认头承载，位置在 auth
++    //    之后 ⇒ 单独交出，见 `V1_TRAILING_HEADER_ORDER`。
++    //    凭据头（authorization / chatgpt-account-id / cookie）在解析期已 fail
++    //    closed，不在承载集合内；本地必需头（host/content-length/accept/
++    //    content-type/content-encoding）与 authorization / chatgpt-account-id
++    //    仍由官方 client、压缩路径与 BearerAuthProvider 自写。
++    let (headers, trailing_headers) = outbound_headers(ctx, &projection);
+ 
+     // capture 旁路（capture-r1）：请求体校验通过后、发上游前入队
+     // （设计 §6.3）。白名单不匹配 = None，零成本原路径。句柄在上游失败
+@@ -143,7 +244,7 @@ pub async fn execute_responses_raw(
+         Operation::Responses,
+     )
+     .await?;
+-    let auth = official_adapter::official_auth(ctx);
++    let auth = official_adapter::official_auth_with_trailing_headers(ctx, trailing_headers);
+     let provider = official_adapter::chatgpt_provider();
+     let api_client =
+         codex_api::ResponsesClient::new(official_adapter::transport_for(client), provider, auth);
+@@ -151,8 +252,15 @@ pub async fn execute_responses_raw(
+     // 5. 官方 raw stream（复用 EndpointSession/auth/compression/retry）。
+     // R6（R-TRANSPORT-001）：terminal non-2xx 原样保留（不再映射为本地
+     // 错误→502），attempt 次数来自官方 retry 循环的真实值。
++    //
++    // ⑤ `Compression::Zstd`：官方 0.159.2 的出站 body 是 zstd 压缩体
++    // （`content-encoding: zstd`，magic `28b52ffd`，`docs/21 §5.1`）。压缩与
++    // 头的写入由同一权威（`http-client/src/request.rs::prepare_encoded_json`）
++    // 完成 ⇒ ctd 结构上不可能「压了没写头」或「写了头没压」；`content-length`
++    // 由传输栈按**压缩后**字节数生成。压缩后的字节存进 `EncodedJsonBody`
++    // （`prepared = true`），retry attempt 复用同一份，不重复压缩。
+     let outcome = api_client
+-        .stream_raw(obj.into(), headers, codex_api::Compression::None, None)
++        .stream_raw(obj.into(), headers, codex_api::Compression::Zstd, None)
+         .await
+         .map_err(|err| map_api_error(err, "responses"))?;
+     let stream = outcome.value;
+@@ -270,8 +378,60 @@ fn _method_probe() -> Method {
+ 
+ #[cfg(test)]
+ mod tests {
++    use super::V1_METADATA_HEADER_ORDER;
++    use super::V1_TRAILING_HEADER_ORDER;
++    use super::outbound_headers;
+     use super::session_headers;
+     use codex_core::CodexResponsesMetadata;
++    use std::collections::BTreeMap;
++
++    /// 生产形态的承载集合（Go `codex_transport_sidecar.go` 写入的 11 个白名单头
++    /// 中，v1 responses 会真的出现的那批）+ 一个未列入官方 18 头的 `openai-beta`。
++    fn carried_fixture() -> BTreeMap<String, String> {
++        BTreeMap::from([
++            ("x-codex-beta-features".to_string(), "remote_compaction_v2".to_string()),
++            (
++                "x-codex-window-id".to_string(),
++                "0198f2b0-0000-7000-8000-000000000002:1".to_string(),
++            ),
++            (
++                "x-codex-turn-metadata".to_string(),
++                r#"{"turn_id":"0198f2b0-0000-7000-8000-000000000003","root_turn_id":"0198f2b0-0000-7000-8000-000000000003","request_kind":"turn"}"#
++                    .to_string(),
++            ),
++            (
++                "x-openai-internal-codex-responses-lite".to_string(),
++                "true".to_string(),
++            ),
++            (
++                "x-codex-routing-hint".to_string(),
++                "model=gpt-5.6-sol".to_string(),
++            ),
++            (
++                "x-client-request-id".to_string(),
++                "0198f2b0-0000-7000-8000-000000000001".to_string(),
++            ),
++            ("originator".to_string(), "codex-tui".to_string()),
++            (
++                "user-agent".to_string(),
++                "codex-tui/0.159.0 (Ubuntu 22.4.0; x86_64) xterm-256color".to_string(),
++            ),
++            (
++                "openai-beta".to_string(),
++                "responses_multi_agent=2026-01-01".to_string(),
++            ),
++        ])
++    }
++
++    fn projection() -> CodexResponsesMetadata {
++        CodexResponsesMetadata::try_for_transport(
++            "installation-1".to_string(),
++            "0198f2b0-0000-7000-8000-000000000001".to_string(),
++            "0198f2b0-0000-7000-8000-000000000002".to_string(),
++            "0198f2b0-0000-7000-8000-000000000002:1".to_string(),
++        )
++        .expect("valid projection")
++    }
+ 
+     #[test]
+     fn projection_roundtrips_official_metadata() {
+@@ -294,6 +454,73 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn metadata_headers_follow_official_construction_order_not_alphabetical() {
++        // ① 官方 0.159.2 的头名序列是强不变量（docs/21 §0.3：5 组采集 × 90 条
++        // POST 零变异）。ctd 自派生段必须是官方构造序；字母序（BTreeMap 迭代序）
++        // 正是 docs/22 §2 实测的旧 v1 头序。
++        let ctx = crate::contract::RequestContext {
++            session: Some(crate::contract::headers::SessionSnapshot {
++                session_id: "0198f2b0-0000-7000-8000-000000000001".to_string(),
++                thread_id: "0198f2b0-0000-7000-8000-000000000002".to_string(),
++                window_id: "0198f2b0-0000-7000-8000-000000000002:1".to_string(),
++            }),
++            carried_headers: carried_fixture(),
++            ..Default::default()
++        };
++        let (headers, trailing) = outbound_headers(&ctx, &projection());
++
++        // 官方序列第 2–9 位，逐位相等。
++        let observed: Vec<&str> = headers.keys().map(|name| name.as_str()).collect();
++        assert_eq!(
++            &observed[..V1_METADATA_HEADER_ORDER.len()],
++            V1_METADATA_HEADER_ORDER,
++            "ctd 自派生头必须按官方构造序排列"
++        );
++        // 反证：字母序不是官方序。
++        let mut alphabetical = observed.clone();
++        alphabetical.sort_unstable();
++        assert_ne!(observed, alphabetical, "官方构造序不得退化为字母序");
++
++        // `originator` / `user-agent` 必须离开自派生段（官方位置在 auth 之后）。
++        assert!(headers.get("originator").is_none());
++        assert!(headers.get("user-agent").is_none());
++        let trailing_order: Vec<&str> = trailing.keys().map(|name| name.as_str()).collect();
++        assert_eq!(trailing_order, V1_TRAILING_HEADER_ORDER.to_vec());
++
++        // 未列入官方 18 头的承载头不丢，且不插进官方前缀。
++        assert_eq!(headers.get("openai-beta").unwrap(), "responses_multi_agent=2026-01-01");
++        assert_eq!(observed.last().copied(), Some("openai-beta"));
++    }
++
++    #[test]
++    fn carried_values_override_local_projection() {
++        // 承载通道是 FR-004 的唯一 header 通道：同名键覆盖本地派生值。
++        let ctx = crate::contract::RequestContext {
++            session: Some(crate::contract::headers::SessionSnapshot {
++                session_id: "0198f2b0-0000-7000-8000-000000000009".to_string(),
++                thread_id: "0198f2b0-0000-7000-8000-00000000000a".to_string(),
++                window_id: "0198f2b0-0000-7000-8000-00000000000a:1".to_string(),
++            }),
++            carried_headers: BTreeMap::from([(
++                "x-codex-beta-features".to_string(),
++                "carried_beta".to_string(),
++            )]),
++            ..Default::default()
++        };
++        let (headers, _) = outbound_headers(&ctx, &projection());
++        assert_eq!(headers.get("x-codex-beta-features").unwrap(), "carried_beta");
++        // 会话快照仍是 session-id / thread-id 的来源（承载未提供时）。
++        assert_eq!(
++            headers.get("session-id").unwrap(),
++            "0198f2b0-0000-7000-8000-000000000009"
++        );
++        assert_eq!(
++            headers.get("thread-id").unwrap(),
++            "0198f2b0-0000-7000-8000-00000000000a"
++        );
++    }
++
+     #[test]
+     fn upstream_headers_never_contain_internal_namespace() {
+         // T3 负向（红线）：x-ctd-user-id 等内部 header 绝不进入上游投影。
+@@ -315,6 +542,19 @@ mod tests {
+                 "internal header {name} leaked to upstream projection"
+             );
+         }
++        // 投影全量（含承载段与尾段）同样不得出现内部命名空间。
++        let ctx = crate::contract::RequestContext {
++            carried_headers: carried_fixture(),
++            user_id: Some("3".to_string()),
++            ..ctx
++        };
++        let (headers, trailing) = outbound_headers(&ctx, &projection());
++        for name in headers.keys().chain(trailing.keys()) {
++            assert!(
++                !name.as_str().starts_with("x-ctd-"),
++                "internal header {name} leaked to upstream projection"
++            );
++        }
+     }
+ 
+     #[test]
+diff --git a/codex-rs/codex-transportd/src/transport/responses_v3.rs b/codex-rs/codex-transportd/src/transport/responses_v3.rs
+index c0fd3625c..b4160ae3c 100644
+--- a/codex-rs/codex-transportd/src/transport/responses_v3.rs
++++ b/codex-rs/codex-transportd/src/transport/responses_v3.rs
+@@ -8,7 +8,7 @@
+ //! |---|---|---|
+ //! | headers | Go 交付白名单**子集**，ctd 自派生其余 | Go 交付白名单**全集**，ctd 只做白名单过滤 |
+ //! | body | ctd 解析 → 改投影 → `serde_json` 重编码 | Go 的**最终字节**，ctd 不解析不改写 |
+-//! | `content-encoding` | ctd 权威，恒 identity | **Go 权威**，ctd 只校验 |
++//! | `content-encoding` | ctd 权威，恒 `zstd`（官方形态） | **Go 权威**，ctd 只校验 |
+ //!
+ //! ★ 边界处理（认证注入 / 超时 / 重试 / SSE 转发 / 审计）全部保留，且由
+ //! 与 v1 **同一段**代码承担：认证注入在
+diff --git a/codex-rs/codex-transportd/tests/capture_upstream_contract.rs b/codex-rs/codex-transportd/tests/capture_upstream_contract.rs
+index 6c5bc4b54..8c725ed61 100644
+--- a/codex-rs/codex-transportd/tests/capture_upstream_contract.rs
++++ b/codex-rs/codex-transportd/tests/capture_upstream_contract.rs
+@@ -1,6 +1,11 @@
+-//! T3 负向（红线，capture-r1 F3）：带 `x-ctd-user-id` 的入站 context 走
+-//! 真实出站构造（`execute_responses_raw` → 官方 client → mock 上游），
+-//! mock 上游观测到的请求头里任何 `x-ctd-*` 一律缺席。
++//! 出站契约（真实出站构造 → mock 上游观测）：
++//!
++//! 1. **T3 负向（红线，capture-r1 F3）**：带 `x-ctd-user-id` 的入站 context 走
++//!    真实出站构造（`execute_responses_raw` → 官方 client → mock 上游），
++//!    mock 上游观测到的请求头里任何 `x-ctd-*` 一律缺席。
++//! 2. **v1 出站保真（docs/22 §6 项 ①/⑤/②）**：头名序列 == 官方 0.159.2 的
++//!    18 头构造序；`content-encoding: zstd` + 真 zstd 体；body `client_metadata`
++//!    键集合 == 官方 9 键。
+ //!
+ //! 隔离：`CTD_TEST_UPSTREAM_BASE_URL` 是进程级 override（仅 test-upstream
+ //! feature 生效，TLS-CTD-001 §15.2 既有测试 harness）。为不污染同进程的
+@@ -79,8 +84,22 @@ fn mock_upstream_never_observes_x_ctd_headers() {
+         saw_bearer,
+         "outbound must carry the official bearer auth path: {head}"
+     );
++    // ⑤ 官方出站 body 是 zstd 压缩体（`docs/21 §5.1`）：mock 上游看到的必须是
++    // 真压缩字节 + 与之一致的 `content-encoding`，解压后才是 ctd 交付的 JSON。
++    assert!(
++        head.to_ascii_lowercase()
++            .contains("\r\ncontent-encoding: zstd\r\n"),
++        "outbound must declare the official zstd encoding: {head}"
++    );
++    assert_eq!(
++        &body[..4],
++        &[0x28, 0xb5, 0x2f, 0xfd],
++        "outbound body must be a zstd frame"
++    );
++    let plain = zstd::stream::decode_all(body.as_slice()).expect("outbound body must decompress");
+     assert!(
+-        body.windows(b"capture-t3-marker".len())
++        plain
++            .windows(b"capture-t3-marker".len())
+             .any(|w| w == b"capture-t3-marker"),
+         "request body must reach the mock upstream byte-true"
+     );
+@@ -200,3 +219,237 @@ async fn capture_t3_mock_upstream_worker() {
+     }
+     assert_eq!(received, b"retry: 0\n\n", "mock body forwards byte-true");
+ }
++
++// ---------------------------------------------------------------------------
++// v1 出站保真（docs/22 §6 项 ①/⑤/②）
++// ---------------------------------------------------------------------------
++
++/// worker 测试名（子进程 --exact 过滤）。
++const V1_FIDELITY_WORKER: &str = "v1_outbound_fidelity_worker";
++/// 子进程标记（防止主套件直跑真实出站）。
++const V1_FIDELITY_CHILD: &str = "CTD_V1_FIDELITY_CHILD";
++
++/// 官方 0.159.2 `POST /backend-api/codex/responses` 的头名序列
++/// （`tools/ctd-parity/baseline/official-1592.json:headers_main_post.rows`，
++/// 5 组采集 × 90 条 POST 零变异 ⇒ 强不变量）。
++const OFFICIAL_POST_HEADER_SEQUENCE: [&str; 18] = [
++    "version",
++    "x-codex-beta-features",
++    "x-codex-window-id",
++    "x-codex-turn-metadata",
++    "x-openai-internal-codex-responses-lite",
++    "x-codex-routing-hint",
++    "x-client-request-id",
++    "session-id",
++    "thread-id",
++    "accept",
++    "content-encoding",
++    "content-type",
++    "authorization",
++    "chatgpt-account-id",
++    "originator",
++    "user-agent",
++    "host",
++    "content-length",
++];
++
++/// 官方 `body.client_metadata` 键集合（同一基准 `body.client_metadata_keys`）。
++const OFFICIAL_CLIENT_METADATA_KEYS: [&str; 9] = [
++    "guardian_credits_requested",
++    "mcp_attribution",
++    "root_turn_id",
++    "session_id",
++    "thread_id",
++    "turn_id",
++    "x-codex-installation-id",
++    "x-codex-turn-metadata",
++    "x-codex-window-id",
++];
++
++#[test]
++fn v1_outbound_matches_official_1592_wire_shape() {
++    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
++    let addr = listener.local_addr().expect("addr");
++    let server = std::thread::spawn(move || serve_one(&listener));
++
++    let exe = std::env::current_exe().expect("current test binary");
++    let out = Command::new(exe)
++        .args([V1_FIDELITY_WORKER, "--exact", "--test-threads=1"])
++        .env("CTD_TEST_UPSTREAM_BASE_URL", format!("http://{addr}"))
++        .env(V1_FIDELITY_CHILD, "1")
++        .output()
++        .expect("spawn worker child");
++    assert!(
++        out.status.success(),
++        "worker failed\nstdout:\n{}\nstderr:\n{}",
++        String::from_utf8_lossy(&out.stdout),
++        String::from_utf8_lossy(&out.stderr),
++    );
++
++    let (head, body) = server.join().expect("mock server thread");
++    let mut lines = head.split("\r\n");
++    assert!(
++        lines
++            .next()
++            .unwrap_or_default()
++            .starts_with("POST /responses"),
++        "unexpected request line: {head}"
++    );
++    let header_pairs: Vec<(String, String)> = lines
++        .take_while(|line| !line.is_empty())
++        .filter_map(|line| line.split_once(':'))
++        .map(|(name, value)| {
++            (
++                name.trim().to_ascii_lowercase(),
++                value.trim().to_string(),
++            )
++        })
++        .collect();
++    let names: Vec<String> = header_pairs.iter().map(|(name, _)| name.clone()).collect();
++    // ① 头名序列（含顺序）必须逐位等于官方构造序。
++    assert_eq!(names, OFFICIAL_POST_HEADER_SEQUENCE, "wire head:\n{head}");
++    let values: std::collections::HashMap<String, String> = header_pairs.into_iter().collect();
++    // ⑥ 身份：`version` 与 UA 版本段同源；UA 取官方 TUI 形态（尾后缀按
++    // originator 补齐），平台/终端段保持承载值。
++    let version = env!("CARGO_PKG_VERSION");
++    assert_eq!(values["version"], version);
++    assert_eq!(values["originator"], "codex-tui");
++    assert_eq!(
++        values["user-agent"],
++        format!("codex-tui/{version} (Ubuntu 22.4.0; x86_64) xterm-256color (codex-tui; {version})")
++    );
++    // `session-id` / `thread-id` 由会话快照派生；承载通道未提供时不得缺失。
++    assert_eq!(values["session-id"], "0198f2b0-0000-7000-8000-000000000001");
++    assert_eq!(values["thread-id"], "0198f2b0-0000-7000-8000-000000000002");
++
++    // ⑤ 真压缩 + 与之一致的头 + content-length = 压缩后字节数。
++    assert_eq!(&body[..4], &[0x28, 0xb5, 0x2f, 0xfd], "body must be zstd");
++    let declared: usize = head
++        .split("\r\n")
++        .filter_map(|line| line.split_once(':'))
++        .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
++        .and_then(|(_, value)| value.trim().parse().ok())
++        .expect("content-length present");
++    assert_eq!(declared, body.len(), "content-length must be the zstd size");
++
++    // ② body `client_metadata` 键集合 == 官方 9 键。
++    let plain = zstd::stream::decode_all(body.as_slice()).expect("zstd body");
++    let request: serde_json::Value = serde_json::from_slice(&plain).expect("json body");
++    let metadata = request["client_metadata"]
++        .as_object()
++        .expect("client_metadata object");
++    let mut keys: Vec<&str> = metadata.keys().map(String::as_str).collect();
++    keys.sort_unstable();
++    let mut expected = OFFICIAL_CLIENT_METADATA_KEYS.to_vec();
++    expected.sort_unstable();
++    assert_eq!(keys, expected);
++    // 派生键的真值（官方 exec 0.159.2 基准值）。
++    assert_eq!(metadata["guardian_credits_requested"], "true");
++    assert_eq!(metadata["mcp_attribution"], r#"{"status":"none"}"#);
++    assert_eq!(
++        metadata["turn_id"],
++        metadata["x-codex-turn-metadata"]
++            .as_str()
++            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
++            .and_then(|turn| turn["turn_id"].as_str().map(str::to_owned))
++            .expect("turn_id present in turn metadata")
++    );
++    // I6/I7：body 与请求头同源。
++    let header_turn_metadata = head
++        .split("\r\n")
++        .filter_map(|line| line.split_once(':'))
++        .find(|(name, _)| name.trim().eq_ignore_ascii_case("x-codex-turn-metadata"))
++        .map(|(_, value)| value.trim().to_string())
++        .expect("x-codex-turn-metadata header");
++    assert_eq!(
++        metadata["x-codex-turn-metadata"].as_str().unwrap(),
++        header_turn_metadata
++    );
++    assert_eq!(metadata["root_turn_id"], metadata["turn_id"]);
++}
++
++/// 子进程内执行真实出站构造（生产形态的承载集合）；env 由父进程注入。
++#[tokio::test]
++async fn v1_outbound_fidelity_worker() {
++    if std::env::var(V1_FIDELITY_CHILD).is_err() {
++        // 主套件直跑占位：真实逻辑仅由父测试 spawn 的 --exact 子进程执行。
++        return;
++    }
++    let base = std::env::var("CTD_TEST_UPSTREAM_BASE_URL").unwrap_or_default();
++    assert!(
++        !base.is_empty(),
++        "run via v1_outbound_matches_official_1592_wire_shape"
++    );
++    assert_eq!(std::env::var(V1_FIDELITY_CHILD).as_deref(), Ok("1"));
++
++    // 生产形态承载集合：Go 白名单里 v1 responses 实际会出现的头。
++    let carried = std::collections::BTreeMap::from([
++        (
++            "x-codex-beta-features".to_string(),
++            "remote_compaction_v2".to_string(),
++        ),
++        (
++            "x-codex-window-id".to_string(),
++            "0198f2b0-0000-7000-8000-000000000002:1".to_string(),
++        ),
++        (
++            "x-codex-turn-metadata".to_string(),
++            r#"{"request_kind":"turn","session_id":"0198f2b0-0000-7000-8000-000000000001","thread_id":"0198f2b0-0000-7000-8000-000000000002","turn_id":"0198f2b0-0000-7000-8000-000000000003","root_turn_id":"0198f2b0-0000-7000-8000-000000000003","window_id":"0198f2b0-0000-7000-8000-000000000002:1"}"#
++                .to_string(),
++        ),
++        (
++            "x-openai-internal-codex-responses-lite".to_string(),
++            "true".to_string(),
++        ),
++        (
++            "x-codex-routing-hint".to_string(),
++            "model=gpt-5.6-sol".to_string(),
++        ),
++        (
++            "x-client-request-id".to_string(),
++            "0198f2b0-0000-7000-8000-000000000001".to_string(),
++        ),
++        ("originator".to_string(), "codex-tui".to_string()),
++        (
++            "user-agent".to_string(),
++            "codex-tui/0.159.0 (Ubuntu 22.4.0; x86_64) xterm-256color".to_string(),
++        ),
++    ]);
++    let ctx = RequestContext {
++        request_id: "req_v1_fidelity".to_string(),
++        account_key: "acct".to_string(),
++        credential_revision: "rev-1".to_string(),
++        access_token: SecretString::new("test-token"),
++        chatgpt_account_id: Some(SecretString::new("acc-1")),
++        proxy_kind: codex_transportd::contract::ProxyKind::Direct,
++        session: Some(SessionSnapshot {
++            session_id: "0198f2b0-0000-7000-8000-000000000001".to_string(),
++            thread_id: "0198f2b0-0000-7000-8000-000000000002".to_string(),
++            window_id: "0198f2b0-0000-7000-8000-000000000002:1".to_string(),
++        }),
++        carried_headers: carried,
++        ..Default::default()
++    };
++    let pool = ClientPool::new(std::sync::Arc::new(Metrics::default()));
++    let body: Bytes = serde_json::json!({
++        "model": "gpt-5.6-sol",
++        "input": [{
++            "role": "user",
++            "content": [{"type": "input_text", "text": "v1-fidelity-marker"}],
++        }],
++        "store": false,
++        "stream": true,
++    })
++    .to_string()
++    .into_bytes()
++    .into();
++
++    let resp = execute_responses_raw(&pool, "installation-1", &ctx, body)
++        .await
++        .expect("real outbound construction must execute");
++    assert_eq!(resp.status, 200, "mock upstream answered 200");
++    let mut stream = resp.body;
++    while let Some(chunk) = stream.next().await {
++        chunk.expect("mock stream chunk");
++    }
++}
+-- 
+2.48.1
+

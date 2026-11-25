@@ -1,0 +1,79 @@
+From ff5ce0d0a038e01a7bc24d1608d14a6095575d99 Mon Sep 17 00:00:00 2001
+From: Shanks <shanks@book>
+Date: Mon, 7 Sep 2026 16:50:05 +0800
+Subject: [PATCH 07/37] replay0905-patch(7/8): login auth
+
+(cherry picked from commit 478a35ecf486e0902faa90b1673078b7bd8ac87b)
+---
+ codex-rs/login/src/auth/default_client.rs        | 2 +-
+ codex-rs/login/src/auth/manager.rs               | 2 +-
+ codex-rs/login/src/auth/mod.rs                   | 2 ++
+ codex-rs/login/src/auth/personal_access_token.rs | 6 ++++--
+ 4 files changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/codex-rs/login/src/auth/default_client.rs b/codex-rs/login/src/auth/default_client.rs
+index 28a952ea2..47c68fe3d 100644
+--- a/codex-rs/login/src/auth/default_client.rs
++++ b/codex-rs/login/src/auth/default_client.rs
+@@ -441,7 +441,7 @@ pub(crate) fn create_raw_auth_client(
+ }
+ 
+ /// Builds the default Codex HTTP client wrapper for an auth endpoint.
+-pub(crate) fn create_default_auth_client(
++pub fn create_default_auth_client(
+     endpoint: &str,
+     auth_route_config: &AuthRouteConfig,
+ ) -> Result<HttpClient, BuildRouteAwareHttpClientError> {
+diff --git a/codex-rs/login/src/auth/manager.rs b/codex-rs/login/src/auth/manager.rs
+index cdc9c8d35..65e5c6e4f 100644
+--- a/codex-rs/login/src/auth/manager.rs
++++ b/codex-rs/login/src/auth/manager.rs
+@@ -1724,7 +1724,7 @@ pub fn oauth_client_id() -> String {
+         .unwrap_or_else(|| CLIENT_ID.to_string())
+ }
+ 
+-fn refresh_token_endpoint() -> String {
++pub fn refresh_token_endpoint() -> String {
+     std::env::var(REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR)
+         .unwrap_or_else(|_| REFRESH_TOKEN_URL.to_string())
+ }
+diff --git a/codex-rs/login/src/auth/mod.rs b/codex-rs/login/src/auth/mod.rs
+index 226255f39..9a2fe1e56 100644
+--- a/codex-rs/login/src/auth/mod.rs
++++ b/codex-rs/login/src/auth/mod.rs
+@@ -7,6 +7,8 @@ mod change_state;
+ pub mod default_client;
+ pub mod error;
+ mod personal_access_token;
++pub use personal_access_token::whoami_endpoint;
++pub use personal_access_token::PROD_AUTHAPI_BASE_URL;
+ mod storage;
+ mod util;
+ mod workload_identity;
+diff --git a/codex-rs/login/src/auth/personal_access_token.rs b/codex-rs/login/src/auth/personal_access_token.rs
+index dba80c8f9..909bbe4b9 100644
+--- a/codex-rs/login/src/auth/personal_access_token.rs
++++ b/codex-rs/login/src/auth/personal_access_token.rs
+@@ -8,7 +8,8 @@ use std::fmt;
+ use crate::default_client::create_default_auth_client;
+ use crate::outbound_proxy::AuthRouteConfig;
+ 
+-const PROD_AUTHAPI_BASE_URL: &str = "https://auth.openai.com/api/accounts";
++/// 官方 auth API base(P1 auth 平面固定端点)。
++pub const PROD_AUTHAPI_BASE_URL: &str = "https://auth.openai.com/api/accounts";
+ const CODEX_AUTHAPI_BASE_URL_ENV_VAR: &str = "CODEX_AUTHAPI_BASE_URL";
+ const WHOAMI_PATH: &str = "/v1/user-auth-credential/whoami";
+ 
+@@ -112,7 +113,8 @@ async fn hydrate_personal_access_token(
+     })
+ }
+ 
+-fn whoami_endpoint(authapi_base_url: &str) -> String {
++/// 官方 PAT whoami 端点(固定路径,供 transport sidecar 使用;TLS-CTD-001 P1 auth)。
++pub fn whoami_endpoint(authapi_base_url: &str) -> String {
+     format!("{}{WHOAMI_PATH}", authapi_base_url.trim_end_matches('/'))
+ }
+ 
+-- 
+2.48.1
+

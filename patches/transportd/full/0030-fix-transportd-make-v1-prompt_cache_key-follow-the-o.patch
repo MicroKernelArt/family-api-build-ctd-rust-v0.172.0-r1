@@ -1,0 +1,275 @@
+From 76c63c2cc016126ef25ee57f5b322510bda13b4c Mon Sep 17 00:00:00 2001
+From: Shanks <shanks@book>
+Date: Fri, 2 Oct 2026 00:04:01 +0800
+Subject: [PATCH 30/37] fix(transportd): make v1 prompt_cache_key follow the
+ outbound session-id (I8)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+官方 0.159.2 的根会话用同一个值做 `session-id` 头与 body 的
+`prompt_cache_key`（core/src/client.rs: responses_session_id() 在非 subagent
+时返回 prompt_cache_key()）⇒ 基准表 invariants.I8 =
+`body.prompt_cache_key == session-id` 恒成立（docs/21/24）。
+
+v1（hookpoint=v1）的 body 由 ctd 组装，客户端原始 `prompt_cache_key` 是
+客户端自己的会话标识；网关把会话身份换成出站 session-id 后两者脱钩 ⇒
+round-1 装置实测 v1 腿 I8 FAIL（docs/24 §4.2 b）。本提交把它拉回出站身份：
+
+* metadata.rs: 新增 `rewrite_prompt_cache_key(obj, outbound_session_id)`——
+  只在客户端确实带了**非空字符串** `prompt_cache_key` 时改写（不凭空造键；
+  非字符串/空串/已相等一律不动），语义与 Go 侧同项修复
+  （openai_codex_transform.go normalizeCodexOAuthClientMetadataMap）逐条对齐。
+* responses.rs: 在 `execute_responses_raw` 的 body 组装链末尾调用它，改写值取
+  同一处定稿的出站头 `session-id`（与 header / client_metadata.session_id
+  同源，不新增第二个算 session-id 的地方）；v3 路径不受影响。
+
+按官方确定性构造序组装的头投影、压缩、client_metadata 9 键均未改动；受控
+A/B（tools/ctd-parity/i8_probe.py + i8_analyze.py，同 mock 端口 + 同
+codex-home）实测：头逐字相同（仅 content-length 随压缩后字节数变化），
+body 路径级 diff = ['/prompt_cache_key']，不带该键的入站 body 逐字节不变。
+---
+ .../src/transport/metadata.rs                 | 97 +++++++++++++++++++
+ .../src/transport/responses.rs                | 96 ++++++++++++++++++
+ 2 files changed, 193 insertions(+)
+
+diff --git a/codex-rs/codex-transportd/src/transport/metadata.rs b/codex-rs/codex-transportd/src/transport/metadata.rs
+index 406bab294..cf866d618 100644
+--- a/codex-rs/codex-transportd/src/transport/metadata.rs
++++ b/codex-rs/codex-transportd/src/transport/metadata.rs
+@@ -305,6 +305,40 @@ pub fn inject_derived_client_metadata(
+     );
+ }
+ 
++/// 不变式 I8（`baseline/official-1592.json:invariants` / `docs/24 §4.2 b`）：
++/// `body.prompt_cache_key` 必须等于**出站** `session-id`。
++///
++/// 官方依据：0.159.2 的根会话用**同一个值**做 `session-id` 头与
++/// `prompt_cache_key`（`core/src/client.rs` 的 `responses_session_id()` 在
++/// 非 subagent 时返回 `prompt_cache_key()`；基准表 `invariants.I8` = PASS）。
++///
++/// v1 的 body 由 ctd 组装，客户端原始 `prompt_cache_key` 是**客户端自己的**
++/// 会话标识（真实 codex CLI 的 session id）⇒ 网关把会话身份换成出站
++/// `session-id` 后两者脱钩（`docs/24 §4.2 b` 登记的 v1 唯一【不可比】差异）。
++/// 本函数把它拉回出站身份。
++///
++/// 语义与 Go 侧同项修复逐条对齐（`openai_codex_transform.go`
++/// `normalizeCodexOAuthClientMetadataMap` 的 I8 分支）：
++/// - 只在客户端**确实带了**非空字符串 `prompt_cache_key` 时改写 ⇒ 不凭空造键；
++/// - 非字符串（客户端畸形输入）/ 空串 / 已等于出站值 ⇒ 原样保留；
++/// - 只改这一个键的值，不动任何其他键（含键序）。
++pub fn rewrite_prompt_cache_key(obj: &mut Map<String, Value>, outbound_session_id: &str) {
++    if outbound_session_id.trim().is_empty() {
++        return;
++    }
++    match obj.get("prompt_cache_key") {
++        Some(Value::String(existing))
++            if !existing.trim().is_empty() && existing != outbound_session_id =>
++        {
++            obj.insert(
++                "prompt_cache_key".to_string(),
++                Value::String(outbound_session_id.to_string()),
++            );
++        }
++        _ => {}
++    }
++}
++
+ /// 构造官方 metadata 投影（UUIDv7 校验在入口完成）。
+ pub fn build_projection(
+     installation_id: &str,
+@@ -520,6 +554,69 @@ mod tests {
+         let api_key = assembled_client_metadata(&Default::default(), /*chatgpt*/ false);
+         assert!(api_key.get("guardian_credits_requested").is_none());
+     }
++
++    fn body_object(value: Value) -> Map<String, Value> {
++        value.as_object().cloned().expect("JSON object")
++    }
++
++    /// I8（正面）：客户端带了非空 `prompt_cache_key` ⇒ 改写成**出站** session-id，
++    /// 且其余键逐字不变。
++    #[test]
++    fn prompt_cache_key_follows_the_outbound_session_id() {
++        let outbound_session_id = "01a0f7e2-8d7e-73b1-a4f0-d903f408d712";
++        let mut obj = body_object(serde_json::json!({
++            "model": "gpt-5.6-sol",
++            "prompt_cache_key": "01a0f307-43d2-7a92-90b5-c0d6ec15eed3",
++            "stream": true,
++        }));
++        rewrite_prompt_cache_key(&mut obj, outbound_session_id);
++        // I8：body.prompt_cache_key == 出站 session-id。
++        assert_eq!(obj["prompt_cache_key"], outbound_session_id);
++        assert_eq!(obj["model"], "gpt-5.6-sol");
++        assert_eq!(obj["stream"], serde_json::json!(true));
++    }
++
++    /// I8（反面·不造键）：客户端没带 `prompt_cache_key` ⇒ 不得凭空制造
++    /// （与 Go 侧同项修复语义一致：`prompt_cache_key` 缺失属输入驱动）。
++    #[test]
++    fn absent_prompt_cache_key_is_not_synthesized() {
++        let mut obj = body_object(serde_json::json!({"model": "gpt-5.6-sol"}));
++        rewrite_prompt_cache_key(&mut obj, "0198f2b0-0000-7000-8000-000000000001");
++        assert!(
++            obj.get("prompt_cache_key").is_none(),
++            "客户端未带缓存键时不得制造该键"
++        );
++    }
++
++    /// 非字符串 / 空串 / 已等于出站值 ⇒ 一律原样保留（不多引入一处差异）。
++    #[test]
++    fn non_string_empty_or_matching_prompt_cache_key_is_left_alone() {
++        let outbound_session_id = "0198f2b0-0000-7000-8000-000000000001";
++        for raw in [
++            serde_json::json!(null),
++            serde_json::json!(7),
++            serde_json::json!({"nested": "object"}),
++            serde_json::json!(""),
++            serde_json::json!("   "),
++        ] {
++            let mut obj = body_object(serde_json::json!({ "prompt_cache_key": raw.clone() }));
++            rewrite_prompt_cache_key(&mut obj, outbound_session_id);
++            assert_eq!(obj["prompt_cache_key"], raw, "非空字符串以外一律不动: {raw}");
++        }
++        // 已相等 ⇒ 连序列化结果都逐字不变。
++        let mut obj = body_object(serde_json::json!({ "prompt_cache_key": outbound_session_id }));
++        let before = Value::Object(obj.clone()).to_string();
++        rewrite_prompt_cache_key(&mut obj, outbound_session_id);
++        assert_eq!(Value::Object(obj).to_string(), before);
++    }
++
++    /// 出站 session-id 为空（不可达的防御分支）⇒ 不改写。
++    #[test]
++    fn empty_outbound_session_id_is_a_noop() {
++        let mut obj = body_object(serde_json::json!({"prompt_cache_key": "client-key"}));
++        rewrite_prompt_cache_key(&mut obj, "  ");
++        assert_eq!(obj["prompt_cache_key"], "client-key");
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/codex-rs/codex-transportd/src/transport/responses.rs b/codex-rs/codex-transportd/src/transport/responses.rs
+index 1b050c2c9..b24950361 100644
+--- a/codex-rs/codex-transportd/src/transport/responses.rs
++++ b/codex-rs/codex-transportd/src/transport/responses.rs
+@@ -226,6 +226,19 @@ pub async fn execute_responses_raw(
+     //    仍由官方 client、压缩路径与 BearerAuthProvider 自写。
+     let (headers, trailing_headers) = outbound_headers(ctx, &projection);
+ 
++    // I8：`body.prompt_cache_key` 随**出站** session-id（官方根会话两者同源，
++    // 基准表 `invariants.I8` = PASS；v1 的原始值是客户端自己的会话标识，
++    // 见 `metadata::rewrite_prompt_cache_key` 的文档）。改写值就取上一步定稿的
++    // 出站头 `session-id` ⇒ 与 v1 写入 header / body
++    // `client_metadata.session_id` 的是同一个值，不新增第二个算 session-id 的
++    // 地方；只影响该键（`docs/24 §4.2 b`）。
++    if let Some(outbound_session_id) = headers
++        .get("session-id")
++        .and_then(|value| value.to_str().ok())
++    {
++        metadata::rewrite_prompt_cache_key(&mut obj, outbound_session_id);
++    }
++
+     // capture 旁路（capture-r1）：请求体校验通过后、发上游前入队
+     // （设计 §6.3）。白名单不匹配 = None，零成本原路径。句柄在上游失败
+     // 早退时 Drop → best-effort Done(ok=false) → 诚实 .resp.err 终态。
+@@ -382,7 +395,10 @@ mod tests {
+     use super::V1_TRAILING_HEADER_ORDER;
+     use super::outbound_headers;
+     use super::session_headers;
++    use crate::transport::metadata;
+     use codex_core::CodexResponsesMetadata;
++    use serde_json::Map;
++    use serde_json::Value;
+     use std::collections::BTreeMap;
+ 
+     /// 生产形态的承载集合（Go `codex_transport_sidecar.go` 写入的 11 个白名单头
+@@ -557,6 +573,86 @@ mod tests {
+         }
+     }
+ 
++    /// I8 的合成层断言（`baseline/official-1592.json:invariants.I8` /
++    /// `docs/24 §4.2 b`）：v1 body 的 `prompt_cache_key` 与**出站头**
++    /// `session-id` 同源 ⇒ `body.prompt_cache_key == 出站 session-id`；且这一步
++    /// 只改这一个键（其余 JSON 路径逐字不变）。
++    ///
++    /// 入站 body 复刻 round-1 装置用的真实样本
++    /// （`tools/ctd-parity/fixtures/inbound-codex-0159.json` 的 body：客户端自带
++    /// `prompt_cache_key` = 客户端自己的会话标识）。
++    #[test]
++    fn i8_prompt_cache_key_equals_outbound_session_id_and_touches_nothing_else() {
++        let mut ctx = crate::contract::RequestContext {
++            session: Some(crate::contract::headers::SessionSnapshot {
++                session_id: "01a0f7e2-8d7e-73b1-a4f0-d903f408d712".to_string(),
++                thread_id: "01a0f7e2-8d7e-73b1-a4f0-d903f408d712".to_string(),
++                window_id: "01a0f7e2-8d7e-73b1-a4f0-d903f408d712:1".to_string(),
++            }),
++            ..Default::default()
++        };
++        ctx.carried_headers = BTreeMap::from([(
++            "session-id".to_string(),
++            "01a0f7e2-8d7e-73b1-a4f0-d903f408d712".to_string(),
++        )]);
++        let (headers, _) = outbound_headers(&ctx, &projection());
++        let outbound_session_id = headers
++            .get("session-id")
++            .expect("v1 必写出站 session-id")
++            .to_str()
++            .expect("ASCII session-id");
++
++        let before: Map<String, Value> = serde_json::from_str(
++            r#"{"model":"gpt-5.6-sol","instructions":"ctd parity probe","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"stream":true,"store":false,"prompt_cache_key":"01a0f307-43d2-7a92-90b5-c0d6ec15eed3"}"#,
++        )
++        .expect("fixture body");
++        let mut after = before.clone();
++        metadata::rewrite_prompt_cache_key(&mut after, outbound_session_id);
++
++        // I8：body.prompt_cache_key == 出站 session-id（此处就是出站头的值）。
++        assert_eq!(after["prompt_cache_key"], outbound_session_id);
++        // 「只影响一项」的可重算断言：除该键外零差异。
++        assert_eq!(
++            changed_paths(&Value::Object(before), &Value::Object(after)),
++            vec!["/prompt_cache_key".to_string()]
++        );
++    }
++
++    /// 客户端**没带** `prompt_cache_key` ⇒ 组装后也不得有该键（不凭空造键）。
++    #[test]
++    fn i8_absent_client_cache_key_stays_absent() {
++        let mut obj: Map<String, Value> =
++            serde_json::from_str(r#"{"model":"gpt-5.6-sol","stream":true}"#).expect("body");
++        metadata::rewrite_prompt_cache_key(&mut obj, "01a0f7e2-8d7e-73b1-a4f0-d903f408d712");
++        assert!(obj.get("prompt_cache_key").is_none());
++    }
++
++    /// 两棵 JSON 树间「值不同」的路径集合（`/a/b`），用于断言「只改了一个键」。
++    fn changed_paths(before: &Value, after: &Value) -> Vec<String> {
++        fn walk(before: &Value, after: &Value, path: &str, out: &mut Vec<String>) {
++            match (before, after) {
++                (Value::Object(before), Value::Object(after)) => {
++                    for (key, value) in before {
++                        let child = format!("{path}/{key}");
++                        match after.get(key) {
++                            Some(other) => walk(value, other, &child, out),
++                            None => out.push(child),
++                        }
++                    }
++                    for key in after.keys().filter(|key| !before.contains_key(key.as_str())) {
++                        out.push(format!("{path}/{key}"));
++                    }
++                }
++                _ if before != after => out.push(path.to_string()),
++                _ => {}
++            }
++        }
++        let mut out = Vec::new();
++        walk(before, after, "", &mut out);
++        out.sort();
++        out
++    }
++
+     #[test]
+     fn invalid_session_fails_before_io() {
+         let err = CodexResponsesMetadata::try_for_transport(
+-- 
+2.48.1
+

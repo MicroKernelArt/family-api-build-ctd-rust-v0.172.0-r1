@@ -1,0 +1,1540 @@
+From 060ec6970b052fa10bed1db73bb586a1fed4b70f Mon Sep 17 00:00:00 2001
+From: Shanks <shanks@book>
+Date: Thu, 1 Oct 2026 19:38:10 +0800
+Subject: [PATCH 26/37] feat(transportd): implement hookpoint=v3 passthrough
+ (Go owns the request)
+
+v3 replaces the inputs of the request-construction step only. The auth
+injection closure (session.rs 237-238 in the switch commit), the retry loop,
+the timeout and the SSE relay stay byte-identical.
+
+- codex-api: stream_raw_bytes_with / execute_raw_bytes_with take
+  Option<RequestBody> and call no configure closure; stream_raw_passthrough /
+  execute_raw_passthrough feed RequestBody::Raw + RequestCompression::None, so
+  ctd neither compresses nor writes content-encoding/content-type (the Raw
+  branch of prepare_body_for_send only clones headers and body).
+- transportd/transport/responses_v3.rs: responses and compact both filter the
+  Go header set through V3_HEADER_ALLOWLIST, then check required headers,
+  content-encoding <-> body shape, and the header self-consistency audit --
+  all before any upstream I/O. Failure is always fail-closed; v3 never falls
+  back to v1 (that would poison the A/B comparison).
+- chatgpt_provider_bare keeps ctd from injecting its own version when Go did
+  not deliver one (HeaderMap::extend replaces same-name keys but keeps
+  provider-only ones).
+- contract/headers.rs: X-CTD-Outbound-Headers, V3_HEADER_ALLOWLIST,
+  V3_REQUIRED_HEADERS, V3_AUDIT_HEADERS, V3_CONTENT_ENCODINGS, and a
+  spec-driven carrier parser shared with the v1 channel. Outbound headers are
+  parsed only when hookpoint == v3, so a v1 request carrying the channel is
+  unaffected.
+- v1 path unchanged: same functions, same arguments, only re-indented.
+
+Tests: cargo test -p codex-transportd (174 lib + all integration suites) and
+cargo test -p codex-api pass. The two lifecycle/uds tests fail on this machine
+only because umask is 0000 and tempfile therefore creates world-writable dirs,
+which verify_socket_parent_dir rejects; they pass under umask 077 and the guard
+is untouched by this change.
+---
+ codex-rs/codex-api/src/endpoint/responses.rs  |  63 ++
+ codex-rs/codex-api/src/endpoint/session.rs    |  88 +++
+ codex-rs/codex-api/tests/clients.rs           |  91 +++
+ .../codex-transportd/src/contract/headers.rs  | 323 ++++++++-
+ codex-rs/codex-transportd/src/server/mod.rs   |  53 +-
+ .../codex-transportd/src/transport/mod.rs     |   1 +
+ .../src/transport/official_adapter.rs         |  75 +++
+ .../src/transport/responses_v3.rs             | 617 ++++++++++++++++++
+ 8 files changed, 1285 insertions(+), 26 deletions(-)
+ create mode 100644 codex-rs/codex-transportd/src/transport/responses_v3.rs
+
+diff --git a/codex-rs/codex-api/src/endpoint/responses.rs b/codex-rs/codex-api/src/endpoint/responses.rs
+index 97b46e9f8..b70c37395 100644
+--- a/codex-rs/codex-api/src/endpoint/responses.rs
++++ b/codex-rs/codex-api/src/endpoint/responses.rs
+@@ -10,8 +10,10 @@ use crate::requests::headers::subagent_header;
+ use crate::requests::Compression;
+ use crate::sse::spawn_response_stream;
+ use crate::telemetry::SseTelemetry;
++use bytes::Bytes;
+ use codex_client::EncodedJsonBody;
+ use codex_client::HttpTransport;
++use codex_client::RequestBody;
+ use codex_client::RequestCompression;
+ use codex_client::RequestTelemetry;
+ use codex_protocol::protocol::SessionSource;
+@@ -170,6 +172,67 @@ impl<T: HttpTransport> ResponsesClient<T> {
+             .await
+     }
+ 
++    /// v3（hookpoint=v3）raw 透传：body 是 Go 交付的**最终字节**，
++    /// headers 是 Go 交付的**完整出站头集**，ctd 原样发出
++    /// （docs/20 §3.5 / §4.3 M2）。
++    ///
++    /// ★ 与 [`Self::stream_raw`] 的关键差异：
++    /// - body 走 [`RequestBody::Raw`] 且 compression 恒为
++    ///   [`RequestCompression::None`]。该组合下 `prepare_body_for_send`
++    ///   只把 headers 与 body 原样 clone——**既不写也不改**
++    ///   `content-encoding` / `content-type`（见
++    ///   `codex-http-client/src/request.rs` 的 `Raw` 分支）；
++    /// - **不经 `configure` 闭包**：v3 下 ctd 不写 `accept`、不设
++    ///   compression。`accept` / `content-type` 由 Go 交付，缺失由调用方
++    ///   在发出前 fail closed。
++    ///
++    /// 由此得到 §3.3 R1/R3 的结构性保证：**ctd 不可能"压了没写头"或
++    /// "写了头没压"**——`Raw` + 压缩会直接报错，而这里压缩恒为 `None`。
++    /// 认证注入、retry、SSE 转发与 v1 共用同一 `EndpointSession` 闭包。
++    #[instrument(
++        name = "responses.stream_raw_passthrough",
++        level = "info",
++        skip_all,
++        fields(
++            transport = "responses_http",
++            http.method = "POST",
++            api.path = "responses"
++        )
++    )]
++    pub async fn stream_raw_passthrough(
++        &self,
++        body: Bytes,
++        extra_headers: HeaderMap,
++    ) -> Result<codex_client::RawRetryOutcome<codex_client::StreamResponse>, ApiError> {
++        self.session
++            .stream_raw_bytes_with(
++                Method::POST,
++                "/responses",
++                extra_headers,
++                Some(RequestBody::Raw(body)),
++            )
++            .await
++    }
++
++    /// v3 raw compact 透传（与 [`Self::stream_raw_passthrough`] 同构）：
++    /// body 原样、headers 原样、timeout 显式传入。
++    pub async fn execute_raw_passthrough(
++        &self,
++        body: Bytes,
++        extra_headers: HeaderMap,
++        request_timeout: Duration,
++    ) -> Result<codex_client::RawRetryOutcome<codex_client::Response>, ApiError> {
++        self.session
++            .execute_raw_bytes_with(
++                Method::POST,
++                "/responses/compact",
++                extra_headers,
++                Some(RequestBody::Raw(body)),
++                Some(request_timeout),
++            )
++            .await
++    }
++
+     /// Raw upstream compact execution for the transport sidecar
+     /// (TLS-CTD-001 FR-012, R6 preservation).
+     ///
+diff --git a/codex-rs/codex-api/src/endpoint/session.rs b/codex-rs/codex-api/src/endpoint/session.rs
+index 04260134f..291aa2dfa 100644
+--- a/codex-rs/codex-api/src/endpoint/session.rs
++++ b/codex-rs/codex-api/src/endpoint/session.rs
+@@ -242,4 +242,92 @@ impl<T: HttpTransport> EndpointSession<T> {
+         .await
+         .map_err(ApiError::from)
+     }
++
++    /// v3（hookpoint=v3）raw 流式形态：body 是 Go 交付的**最终字节**，
++    /// ctd 原样透传（docs/20 §3.5 / §4.3 M1）。
++    ///
++    /// 与 [`Self::stream_raw_with`] 的差异**只在输入**，落在
++    /// `make_request → into_prepared` 这一段（`stream_raw_with` 的 224–226）：
++    /// - `extra_headers` 已是 Go 交付的**完整出站头集**，且 **不调用
++    ///   `configure` 闭包**——v3 下 ctd 不做任何 header/compression 决策；
++    /// - `body` 是 [`RequestBody::Raw`]，不走 `EncodedJson` 的 JSON 编码与
++    ///   压缩路径 ⇒ 字节逐字一致、键序与空白全部保留。
++    ///
++    /// 之后的一切与 v1 **逐字相同**：`into_prepared` 定稿 body，
++    /// `request.clone()` 供每次 attempt（`Bytes` 引用计数克隆，零拷贝），
++    /// `auth.apply_auth` 在发出前注入凭据，retry/超时/SSE 转发由官方
++    /// telemetry + retry 循环承担。★ 认证注入闭包**不做任何改动**。
++    #[instrument(
++        name = "endpoint_session.stream_raw_bytes_with",
++        level = "info",
++        skip_all,
++        fields(http.method = %method, api.path = path)
++    )]
++    pub(crate) async fn stream_raw_bytes_with(
++        &self,
++        method: Method,
++        path: &str,
++        extra_headers: HeaderMap,
++        body: Option<RequestBody>,
++    ) -> Result<RawRetryOutcome<StreamResponse>, ApiError> {
++        let request = self.make_request(&method, path, &extra_headers, body.as_ref());
++        let request = request.into_prepared().map_err(TransportError::Build)?;
++        let make_request = || request.clone();
++
++        run_with_request_telemetry_preserving_status(
++            self.provider.retry.to_policy(),
++            self.request_telemetry.clone(),
++            make_request,
++            |req| {
++                let auth = self.auth.clone();
++                let transport = &self.transport;
++                async move {
++                    let req = auth.apply_auth(req).await.map_err(TransportError::from)?;
++                    transport.stream_preserving_status(req).await
++                }
++            },
++        )
++        .await
++        .map_err(ApiError::from)
++    }
++
++    /// v3（hookpoint=v3）raw unary 形态（compact 同构）：与
++    /// [`Self::execute_raw_with`] 同形，但 body 走 [`RequestBody::Raw`] 且
++    /// 不调用 `configure`。`timeout` 显式传入（v3 没有 configure 闭包可写
++    /// `req.timeout`），其余（凭据注入 / retry / 状态保留）逐字同 v1。
++    #[instrument(
++        name = "endpoint_session.execute_raw_bytes_with",
++        level = "info",
++        skip_all,
++        fields(http.method = %method, api.path = path)
++    )]
++    pub(crate) async fn execute_raw_bytes_with(
++        &self,
++        method: Method,
++        path: &str,
++        extra_headers: HeaderMap,
++        body: Option<RequestBody>,
++        timeout: Option<std::time::Duration>,
++    ) -> Result<RawRetryOutcome<Response>, ApiError> {
++        let mut request = self.make_request(&method, path, &extra_headers, body.as_ref());
++        request.timeout = timeout;
++        let request = request.into_prepared().map_err(TransportError::Build)?;
++        let make_request = || request.clone();
++
++        run_with_request_telemetry_preserving_status(
++            self.provider.retry.to_policy(),
++            self.request_telemetry.clone(),
++            make_request,
++            |req| {
++                let auth = self.auth.clone();
++                let transport = &self.transport;
++                async move {
++                    let req = auth.apply_auth(req).await.map_err(TransportError::from)?;
++                    transport.execute_preserving_status(req).await
++                }
++            },
++        )
++        .await
++        .map_err(ApiError::from)
++    }
+ }
+diff --git a/codex-rs/codex-api/tests/clients.rs b/codex-rs/codex-api/tests/clients.rs
+index a7400d306..33174c8a4 100644
+--- a/codex-rs/codex-api/tests/clients.rs
++++ b/codex-rs/codex-api/tests/clients.rs
+@@ -332,6 +332,97 @@ async fn responses_client_sends_extra_headers() -> Result<()> {
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn responses_client_stream_raw_passthrough_sends_go_bytes_verbatim() -> Result<()> {
++    // v3（hookpoint=v3）：body 是 Go 交付的最终字节，headers 是 Go 交付的
++    // 完整出站头集。本测试固定三件事：
++    //   1. body 走 RequestBody::Raw 且字节逐字（任何 JSON 编码/压缩都会破坏它）；
++    //   2. compression 恒 None ⇒ ctd 既不写 content-encoding 也不写 content-type；
++    //   3. 不调用 configure ⇒ ctd 不代补 accept（缺失即由调用方 fail closed）；
++    //      认证注入闭包保持不变（与 v1 同一段代码）。
++    let state = RecordingState::default();
++    let transport = RecordingTransport::new(state.clone());
++    let client = ResponsesClient::new(transport, provider("chatgpt-bare"), Arc::new(StaticAuth::new("tok", "acct")));
++
++    // 故意不是合法 JSON、也不是规范 UTF-8 尾部：任何 re-serialize 都会改变它。
++    let body = Bytes::from_static(b"{\"model\":\"gpt-5\"}  \nnot-json-tail\xFF\xFE");
++    let headers = HeaderMap::from_iter([
++        (
++            http::HeaderName::from_static("accept"),
++            HeaderValue::from_static("text/event-stream"),
++        ),
++        (
++            http::HeaderName::from_static("content-type"),
++            HeaderValue::from_static("application/json"),
++        ),
++        (
++            http::HeaderName::from_static("version"),
++            HeaderValue::from_static("0.159.2"),
++        ),
++    ]);
++
++    let outcome = client
++        .stream_raw_passthrough(body.clone(), headers)
++        .await?;
++    assert_eq!(outcome.attempts, 1);
++
++    let requests = state.take_stream_requests();
++    assert_path_ends_with(&requests, "/responses");
++    let request = &requests[0];
++
++    // 1. 逐字字节 + Raw 形态。
++    match request.body.as_ref() {
++        Some(RequestBody::Raw(raw)) => assert_eq!(raw.as_ref(), body.as_ref()),
++        other => panic!("v3 必须用 RequestBody::Raw 承载 Go 的最终字节，实际 {other:?}"),
++    }
++    assert_eq!(request.compression, codex_client::RequestCompression::None);
++
++    // 2. Go 交付的头原样在，且 ctd 没有新增 content-encoding。
++    assert_eq!(
++        request.headers.get("accept"),
++        Some(&HeaderValue::from_static("text/event-stream"))
++    );
++    assert_eq!(
++        request.headers.get("version"),
++        Some(&HeaderValue::from_static("0.159.2"))
++    );
++    assert_eq!(request.headers.get_all("version").iter().count(), 1);
++    assert!(request.headers.get("content-encoding").is_none());
++
++    // 3. 认证注入闭包不变（与 v1 同一段代码）。
++    assert_eq!(
++        request.headers.get(http::header::AUTHORIZATION),
++        Some(&HeaderValue::from_static("Bearer tok"))
++    );
++    assert_eq!(
++        request.headers.get("ChatGPT-Account-ID"),
++        Some(&HeaderValue::from_static("acct"))
++    );
++    Ok(())
++}
++
++#[tokio::test]
++async fn responses_client_stream_raw_passthrough_does_not_synthesize_accept() -> Result<()> {
++    // v3 下 ctd 不做 header 决策：Go 没给 accept 时 ctd 绝不代补（v1 的
++    // stream_raw 会在 configure 闭包里写 accept: text/event-stream）。
++    let state = RecordingState::default();
++    let client = ResponsesClient::new(
++        RecordingTransport::new(state.clone()),
++        provider("chatgpt-bare"),
++        Arc::new(NoAuth),
++    );
++    let _ = client
++        .stream_raw_passthrough(Bytes::from_static(b"{}"), HeaderMap::new())
++        .await?;
++    let requests = state.take_stream_requests();
++    assert!(
++        requests[0].headers.get("accept").is_none(),
++        "v3 不得代补 accept：缺失必须由调用方在发出前 fail closed"
++    );
++    assert!(requests[0].headers.get("content-type").is_none());
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn responses_client_stream_request_preserves_item_ids() -> Result<()> {
+     let state = RecordingState::default();
+diff --git a/codex-rs/codex-transportd/src/contract/headers.rs b/codex-rs/codex-transportd/src/contract/headers.rs
+index 99a2553f2..ea3a4d08b 100644
+--- a/codex-rs/codex-transportd/src/contract/headers.rs
++++ b/codex-rs/codex-transportd/src/contract/headers.rs
+@@ -101,6 +101,70 @@ pub const CARRIED_HEADER_NAMES: &[&str] = &[
+ /// （与 Go 侧 `codexCarriedHeaderDenylist` 逐字相等）。
+ pub const CARRIED_HEADER_DENYLIST: &[&str] = &["authorization", "chatgpt-account-id", "cookie"];
+ 
++/// v3（hookpoint=v3）完整出站头承载。Go 侧
++/// `codex_transport_sidecar.go` 写入，单个 header 承载 JSON
++/// object<string,string>；编码契约与 [`CARRIED_HEADERS_HEADER`] 逐字一致
++/// （UTF-8 JSON object，键为小写官方 header 名），只是白名单表换成
++/// [`V3_HEADER_ALLOWLIST`]、语义从"投影覆盖"变为"完整出站头集"。
++pub const OUTBOUND_HEADERS_HEADER: &str = "x-ctd-outbound-headers";
++
++/// v3 允许承载的官方出站头白名单（小写）。
++///
++/// 生成规则（docs/20 §3.2，不是拍脑袋写的）：
++/// ```text
++/// V3_HEADER_ALLOWLIST
++///   = 官方 0.159.2 responses 出站头集合（18 头，docs/21 §3.1 实测）
++///     ∩ ¬( ctd-owned 传输头 ∪ 凭据硬护栏 )
++/// ```
++/// 被剔除的四项：`authorization` / `chatgpt-account-id`（凭据，由 ctd 在
++/// `auth.apply_auth` 注入）与 `host` / `content-length`（传输栈按最终字节
++/// 生成）。`accept-encoding` 同为传输栈自有，不在官方 18 头内。
++///
++/// 与 Go 侧 `codexV3HeaderNames` **逐字相等**，由漂移测试钉死
++/// （`codex_transport_v3_headers_test.go`）。
++///
++/// 有意不纳入：`openai-beta`（官方 HTTP POST 不发；R-Go 的 HTTP 传输策略
++/// 同样剥离，见 `applyCodexTransportHeaders` 的 `CodexTransportHTTP` 分支）、
++/// `x-codex-installation-id`（官方不作为 header 发，v3 下账号隔离由 body
++/// 原样透传保证）。
++pub const V3_HEADER_ALLOWLIST: &[&str] = &[
++    "version",
++    "x-codex-beta-features",
++    "x-codex-window-id",
++    "x-codex-turn-metadata",
++    "x-openai-internal-codex-responses-lite",
++    "x-codex-routing-hint",
++    "x-client-request-id",
++    "session-id",
++    "thread-id",
++    "accept",
++    "content-encoding",
++    "content-type",
++    "originator",
++    "user-agent",
++];
++
++/// v3 必需头：v3 下 ctd 不做任何 header 决策（不补 `content-type`、不写
++/// `accept`），缺失即上游 4xx ⇒ 必须在任何 upstream I/O 之前 fail closed
++/// （typed error `missing_v3_required_header`，docs/20 §3.2 / §3.3 R6）。
++pub const V3_REQUIRED_HEADERS: &[&str] = &["accept", "content-type"];
++
++/// v3 审计所需头（docs/20 §3.5 项 1–4）：v3 下 ctd 从"共同权威"降为
++/// "纯消费者 + 审计者"，这些头内自洽不变式是审计对象。
++/// 缺失或自洽性破坏 ⇒ typed error `hookpoint_audit_failed`（fail closed）。
++pub const V3_AUDIT_HEADERS: &[&str] = &[
++    "session-id",
++    "thread-id",
++    "x-codex-window-id",
++    "x-client-request-id",
++    "x-codex-turn-metadata",
++];
++
++/// v3 `content-encoding` 闭集（缺省 = identity）。见 docs/20 §3.3 R4：
++/// 防止 v3 契约被当成"任意透传口"，也防止引入 ctd/上游链路未验证的编码
++/// （`gzip` / `br` / `deflate`）。
++pub const V3_CONTENT_ENCODINGS: &[&str] = &["zstd"];
++
+ /// 请求目的（仅低基数观测，不成为 upstream header/body 字段）。
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+ pub enum RequestPurpose {
+@@ -160,8 +224,17 @@ pub struct RequestContext {
+     /// 解析时只保留 [`CARRIED_HEADER_NAMES`]，凭据键 fail closed；注入端原样
+     /// 写入上游投影（覆盖 sidecar 本地投影）。
+     pub carried_headers: BTreeMap<String, String>,
+-    /// hookpoint 开关（v1/v3；缺失 = v1）。v1 与 v3 走同一条实现路径，
+-    /// 差异只在观测标记（本任务不实现 v3 语义）。
++    /// v3 完整出站头承载（[`OUTBOUND_HEADERS_HEADER`]）：**仅当
++    /// `hookpoint == v3` 时解析**，其余情况恒为空 map。
++    ///
++    /// ★ 为什么按 hookpoint 条件解析：v1 路径必须与"没有 v3 实现之前"
++    /// 逐字相同——v1 请求即使（错误地）携带该头也不得改变解析结果。
++    /// 解析时只保留 [`V3_HEADER_ALLOWLIST`]，凭据键 fail closed；
++    /// 注入端原样写入（v3 下 ctd 不做任何 header 决策）。
++    pub outbound_headers: BTreeMap<String, String>,
++    /// hookpoint 开关（v1/v3；缺失 = v1）。v1 = ctd 自建请求（默认实现，
++    /// 与开关落地前逐字相同）；v3 = ctd 原样转发 Go 交付的完整出站头集
++    /// 与最终 body 字节。
+     pub hookpoint: Hookpoint,
+     /// 内部 traceparent（只建立 Go→Rust child span；不得复制到 upstream）。
+     pub traceparent: Option<String>,
+@@ -494,6 +567,13 @@ pub fn parse_request_context(
+             .map(String::from),
+         user_id: header_str(headers, USER_ID_HEADER).map(String::from),
+         carried_headers: parse_carried_headers(header_str(headers, CARRIED_HEADERS_HEADER))?,
++        // ★ v3 通道只在 hookpoint==v3 时解析：v1 请求（含错误携带该头者）
++        // 的解析结果必须与"没有 v3 实现之前"逐字相同。
++        outbound_headers: if hookpoint == Hookpoint::V3 {
++            parse_outbound_headers(header_str(headers, OUTBOUND_HEADERS_HEADER))?
++        } else {
++            BTreeMap::new()
++        },
+         hookpoint,
+         traceparent: header_str(headers, "traceparent")
+             .filter(|v| !v.is_empty())
+@@ -501,6 +581,33 @@ pub fn parse_request_context(
+     })
+ }
+ 
++/// 承载通道规格：头名 + 白名单 + 错误码。v1（`X-CTD-Carried-Headers`）与
++/// v3（`X-CTD-Outbound-Headers`）共用同一解析器与同一凭据硬护栏，只有
++/// 白名单表与错误码不同（"复用既有模式，不新造第二套"）。
++struct HeaderCarrierSpec {
++    /// 错误正文里的展示名（诊断用，与 header 名逐字一致的大写形态）。
++    label: &'static str,
++    allowlist: &'static [&'static str],
++    invalid_code: &'static str,
++    credential_code: &'static str,
++}
++
++/// v1 承载通道（FR-004 唯一 header 通道）。
++const CARRIED_CARRIER: HeaderCarrierSpec = HeaderCarrierSpec {
++    label: "X-CTD-Carried-Headers",
++    allowlist: CARRIED_HEADER_NAMES,
++    invalid_code: "invalid_carried_headers",
++    credential_code: "carried_headers_credential_rejected",
++};
++
++/// v3 承载通道（hookpoint=v3 的完整出站头集）。
++const OUTBOUND_CARRIER: HeaderCarrierSpec = HeaderCarrierSpec {
++    label: "X-CTD-Outbound-Headers",
++    allowlist: V3_HEADER_ALLOWLIST,
++    invalid_code: "invalid_outbound_headers",
++    credential_code: "outbound_headers_credential_rejected",
++};
++
+ /// 解析并校验白名单承载头（[`CARRIED_HEADERS_HEADER`]）。
+ ///
+ /// 编码契约与 Go 侧 `codex_transport_sidecar.go::encodeCodexCarriedHeaders`
+@@ -513,16 +620,29 @@ pub fn parse_request_context(
+ /// - 凭据键（[`CARRIED_HEADER_DENYLIST`]）→ typed contract error；
+ /// - 白名单外的键 → 丢弃（结构上不可能进入上游投影）。
+ fn parse_carried_headers(raw: Option<&str>) -> Result<BTreeMap<String, String>, LocalError> {
++    parse_header_carrier(&CARRIED_CARRIER, raw)
++}
++
++/// 解析并校验 v3 完整出站头承载（[`OUTBOUND_HEADERS_HEADER`]）。
++/// 与 [`parse_carried_headers`] 同一实现，只换白名单表与错误码。
++fn parse_outbound_headers(raw: Option<&str>) -> Result<BTreeMap<String, String>, LocalError> {
++    parse_header_carrier(&OUTBOUND_CARRIER, raw)
++}
++
++fn parse_header_carrier(
++    spec: &HeaderCarrierSpec,
++    raw: Option<&str>,
++) -> Result<BTreeMap<String, String>, LocalError> {
+     let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+         return Ok(BTreeMap::new());
+     };
+     let decoded: BTreeMap<String, String> = serde_json::from_str(raw).map_err(|_| {
+         LocalError::new(
+-            "invalid_carried_headers",
++            spec.invalid_code,
+             ErrorClass::Contract,
+             ErrorPhase::Validate,
+             false,
+-            "X-CTD-Carried-Headers 不是合法的 JSON object<string,string>",
++            format!("{} 不是合法的 JSON object<string,string>", spec.label),
+         )
+     })?;
+     let mut carried = BTreeMap::new();
+@@ -531,21 +651,21 @@ fn parse_carried_headers(raw: Option<&str>) -> Result<BTreeMap<String, String>,
+         if CARRIED_HEADER_DENYLIST.contains(&name.as_str()) {
+             // 只报 header 名，绝不回显值（值可能是凭据）。
+             return Err(LocalError::new(
+-                "carried_headers_credential_rejected",
++                spec.credential_code,
+                 ErrorClass::Contract,
+                 ErrorPhase::Validate,
+                 false,
+                 format!("承载头禁止携带凭据头 {name}"),
+             ));
+         }
+-        if !CARRIED_HEADER_NAMES.contains(&name.as_str()) || value.is_empty() {
++        if !spec.allowlist.contains(&name.as_str()) || value.is_empty() {
+             continue;
+         }
+         if http::header::HeaderName::from_bytes(name.as_bytes()).is_err()
+             || HeaderValue::from_str(&value).is_err()
+         {
+             return Err(LocalError::new(
+-                "invalid_carried_headers",
++                spec.invalid_code,
+                 ErrorClass::Contract,
+                 ErrorPhase::Validate,
+                 false,
+@@ -575,6 +695,27 @@ impl RequestContext {
+         }
+         headers
+     }
++
++    /// v3 完整出站头 → 上游投影 `HeaderMap`（仅 [`V3_HEADER_ALLOWLIST`]，
++    /// 值原样注入，**不补任何头**）。
++    ///
++    /// ★ v3 下 ctd 不做 header 决策：`content-type` / `accept` 由 Go 交付，
++    /// ctd 只做白名单过滤（`host` / `content-length` / `accept-encoding` 与
++    /// 凭据头在结构上不可能进入——前者不在白名单，后者解析期 fail closed）。
++    /// 缺失即 [`V3_REQUIRED_HEADERS`] 校验 fail closed，ctd 绝不代补。
++    pub fn outbound_header_map(&self) -> HeaderMap {
++        let mut headers = HeaderMap::new();
++        for (name, value) in &self.outbound_headers {
++            let Ok(name) = http::header::HeaderName::from_bytes(name.as_bytes()) else {
++                continue;
++            };
++            let Ok(value) = HeaderValue::from_str(value) else {
++                continue;
++            };
++            headers.insert(name, value);
++        }
++        headers
++    }
+ }
+ 
+ fn now_ms() -> u64 {
+@@ -961,6 +1102,174 @@ mod carried_header_tests {
+     }
+ }
+ 
++#[cfg(test)]
++mod v3_outbound_header_tests {
++    use super::*;
++
++    fn base() -> HeaderMap {
++        let mut headers = http::HeaderMap::new();
++        headers.insert(PROTOCOL_VERSION_HEADER, HeaderValue::from_static("1"));
++        headers.insert(REQUEST_ID_HEADER, HeaderValue::from_static("req_v3"));
++        headers.insert(ACCOUNT_KEY_HEADER, HeaderValue::from_static("ak-1"));
++        headers.insert(CREDENTIAL_REVISION_HEADER, HeaderValue::from_static("rev-1"));
++        headers.insert(ACCESS_TOKEN_HEADER, HeaderValue::from_static("sk-secret"));
++        headers.insert(PROXY_KIND_HEADER, HeaderValue::from_static("direct"));
++        headers.insert(
++            SESSION_ID_HEADER,
++            HeaderValue::from_static("0198f2b0-0000-7000-8000-000000000001"),
++        );
++        headers.insert(
++            THREAD_ID_HEADER,
++            HeaderValue::from_static("0198f2b0-0000-7000-8000-000000000002"),
++        );
++        headers.insert(
++            WINDOW_ID_HEADER,
++            HeaderValue::from_static("0198f2b0-0000-7000-8000-000000000002:1"),
++        );
++        headers
++    }
++
++    /// 官方 159.2 responses 出站头集的合法子集（含白名单内与白名单外两类）。
++    const OUTBOUND_JSON: &str = r#"{"version":"0.159.2","accept":"text/event-stream","content-type":"application/json","user-agent":"codex-tui/0.159.2 (Mac OS 15.5.0; arm64)","host":"chatgpt.com","content-length":"481","accept-encoding":"gzip","x-codex-installation-id":"inst-1"}"#;
++
++    fn with_hookpoint(hookpoint: Option<&str>, outbound: &str) -> Result<RequestContext, LocalError> {
++        let mut headers = base();
++        if let Some(raw) = hookpoint {
++            headers.insert(HOOKPOINT_HEADER, HeaderValue::from_str(raw).expect("value"));
++        }
++        headers.insert(
++            OUTBOUND_HEADERS_HEADER,
++            HeaderValue::from_str(outbound).expect("value"),
++        );
++        parse_request_context(&headers, Operation::Responses)
++    }
++
++    #[test]
++    fn v3_parses_outbound_carrier_and_filters_to_allowlist() {
++        let ctx = with_hookpoint(Some("v3"), OUTBOUND_JSON).expect("parse");
++        assert_eq!(ctx.hookpoint, Hookpoint::V3);
++
++        let outbound = ctx.outbound_header_map();
++        for kept in [
++            "version",
++            "accept",
++            "content-type",
++            "user-agent",
++        ] {
++            assert!(outbound.get(kept).is_some(), "{kept} 必须在 v3 出站集内");
++        }
++        // ctd-owned 传输头与白名单外头在结构上不可能进入（R5）。
++        for dropped in ["host", "content-length", "accept-encoding", "x-codex-installation-id"] {
++            assert!(
++                outbound.get(dropped).is_none(),
++                "{dropped} 不得进入 v3 出站集"
++            );
++        }
++        // 值原样，不做归一化。
++        assert_eq!(outbound.get("version").expect("version"), "0.159.2");
++    }
++
++    #[test]
++    fn v1_ignores_the_v3_carrier_verbatim() {
++        // ★ v1 逐字不变：即使（错误地）携带 v3 通道，v1 的解析结果也必须与
++        // "没有 v3 实现之前"完全一致——不解析、不报错、不改变任何字段。
++        let absent = parse_request_context(&base(), Operation::Responses).expect("parse");
++        let v1_with_carrier = with_hookpoint(Some("v1"), OUTBOUND_JSON).expect("parse");
++        let implicit_v1_with_carrier =
++            with_hookpoint(None, OUTBOUND_JSON).expect("parse");
++
++        for ctx in [&v1_with_carrier, &implicit_v1_with_carrier] {
++            assert_eq!(ctx.hookpoint, Hookpoint::V1);
++            assert!(ctx.outbound_headers.is_empty(), "v1 不得解析 v3 通道");
++            assert!(ctx.outbound_header_map().is_empty());
++            assert_eq!(ctx.request_id, absent.request_id);
++            assert_eq!(ctx.account_key, absent.account_key);
++            assert_eq!(ctx.credential_revision, absent.credential_revision);
++            assert_eq!(ctx.proxy_kind, absent.proxy_kind);
++            assert_eq!(ctx.purpose, absent.purpose);
++            assert_eq!(ctx.session, absent.session);
++            assert_eq!(ctx.carried_headers, absent.carried_headers);
++            assert_eq!(ctx.deadline.is_some(), absent.deadline.is_some());
++            assert_eq!(ctx.admission_timeout_ms, absent.admission_timeout_ms);
++        }
++
++        // 连"非法 v3 通道"在 v1 下也不得报错（v1 完全不看它）。
++        with_hookpoint(Some("v1"), "not-json").expect("v1 不解析该通道");
++    }
++
++    #[test]
++    fn v3_carrier_absent_is_empty_and_never_fails() {
++        // Go 尚未升级（不发该头）时 v3 仍可解析：出站集为空，由必需头校验
++        // 在发出前 fail closed（而不是解析期）。
++        let mut headers = base();
++        headers.insert(HOOKPOINT_HEADER, HeaderValue::from_static("v3"));
++        let ctx = parse_request_context(&headers, Operation::Responses).expect("parse");
++        assert_eq!(ctx.hookpoint, Hookpoint::V3);
++        assert!(ctx.outbound_headers.is_empty());
++    }
++
++    #[test]
++    fn v3_carrier_rejects_credentials_fail_closed() {
++        // 硬护栏在 v3 通道上不得放宽（P8）：出现即 typed error，且绝不回显值。
++        for denied in CARRIED_HEADER_DENYLIST {
++            let raw = format!(r#"{{"{denied}":"secret-value"}}"#);
++            let err = with_hookpoint(Some("v3"), &raw).expect_err("凭据头必须 fail closed");
++            assert_eq!(err.code, "outbound_headers_credential_rejected", "{denied}");
++            assert_eq!(err.class, ErrorClass::Contract);
++            assert_eq!(err.phase, ErrorPhase::Validate);
++            assert!(!format!("{err:?}").contains("secret-value"));
++        }
++    }
++
++    #[test]
++    fn v3_carrier_malformed_is_contract_error() {
++        for raw in ["not-json", "[]", r#"{"accept":1}"#] {
++            let err = with_hookpoint(Some("v3"), raw).expect_err("malformed");
++            assert_eq!(err.code, "invalid_outbound_headers", "{raw}");
++        }
++        // 空白视为"不承载"（与承载通道同语义）。
++        let ctx = with_hookpoint(Some("v3"), "   ").expect("parse");
++        assert!(ctx.outbound_headers.is_empty());
++    }
++
++    #[test]
++    fn v3_allowlist_excludes_ctd_owned_and_credentials() {
++        for name in [
++            "host",
++            "content-length",
++            "accept-encoding",
++            "authorization",
++            "chatgpt-account-id",
++            "cookie",
++        ] {
++            assert!(
++                !V3_HEADER_ALLOWLIST.contains(&name),
++                "{name} 不得进入 V3_HEADER_ALLOWLIST"
++            );
++        }
++        // 必需头必须都在白名单内（否则"必需"永远无法满足）。
++        for name in V3_REQUIRED_HEADERS {
++            assert!(V3_HEADER_ALLOWLIST.contains(name), "{name} 必须在白名单内");
++        }
++        // 审计头必须都在白名单内。
++        for name in V3_AUDIT_HEADERS {
++            assert!(V3_HEADER_ALLOWLIST.contains(name), "{name} 必须在白名单内");
++        }
++        // v3 白名单 ⊇ v1 承载白名单（v3 是全集，v1 是子集），唯一例外是
++        // openai-beta（官方 HTTP POST 不发；R-Go 的 HTTP 策略同样剥离）。
++        for name in CARRIED_HEADER_NAMES {
++            if *name == "openai-beta" {
++                assert!(!V3_HEADER_ALLOWLIST.contains(name));
++                continue;
++            }
++            assert!(
++                V3_HEADER_ALLOWLIST.contains(name),
++                "v1 承载的 {name} 必须仍被 v3 承载"
++            );
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod deadline_tests {
+     use super::*;
+diff --git a/codex-rs/codex-transportd/src/server/mod.rs b/codex-rs/codex-transportd/src/server/mod.rs
+index 088b3ab9c..53ebbfb28 100644
+--- a/codex-rs/codex-transportd/src/server/mod.rs
++++ b/codex-rs/codex-transportd/src/server/mod.rs
+@@ -22,6 +22,7 @@ use tokio::sync::Semaphore;
+ 
+ use crate::build_info;
+ use crate::config::Config;
++use crate::contract::Hookpoint;
+ use crate::contract::RequestContext;
+ use crate::contract::error::ErrorClass;
+ use crate::contract::error::ErrorPhase;
+@@ -352,7 +353,7 @@ async fn execute_operation_inner(
+     body: Bytes,
+ ) -> Result<Response, LocalError> {
+     // 开关接线（步骤 5）：入口打一条低基数日志，标注本次请求实际生效的
+-    // hookpoint。v3 与 v1 走同一条实现路径，差异只在这条标记上。
++    // hookpoint。
+     tracing::info!(
+         operation = ctx.operation.metric_label(),
+         hookpoint = ctx.hookpoint.as_str(),
+@@ -370,24 +371,38 @@ async fn execute_operation_inner(
+         )
+     };
+     let raw = match ctx.operation {
+-        Operation::Responses => {
+-            crate::transport::responses::execute_responses_raw(
+-                &state.pool,
+-                &state.installation_id,
+-                ctx,
+-                body,
+-            )
+-            .await?
+-        }
+-        Operation::ResponsesCompact => {
+-            crate::transport::compact::execute_compact_raw(
+-                &state.pool,
+-                &state.installation_id,
+-                ctx,
+-                body,
+-            )
+-            .await?
+-        }
++        Operation::Responses => match ctx.hookpoint {
++            // v1：ctd 自建请求（默认实现，与开关落地前逐字相同）。
++            Hookpoint::V1 => {
++                crate::transport::responses::execute_responses_raw(
++                    &state.pool,
++                    &state.installation_id,
++                    ctx,
++                    body,
++                )
++                .await?
++            }
++            // v3：原样透传 Go 交付的完整出站头集与最终 body 字节。
++            Hookpoint::V3 => {
++                crate::transport::responses_v3::execute_responses_v3_raw(&state.pool, ctx, body)
++                    .await?
++            }
++        },
++        Operation::ResponsesCompact => match ctx.hookpoint {
++            Hookpoint::V1 => {
++                crate::transport::compact::execute_compact_raw(
++                    &state.pool,
++                    &state.installation_id,
++                    ctx,
++                    body,
++                )
++                .await?
++            }
++            Hookpoint::V3 => {
++                crate::transport::responses_v3::execute_compact_v3_raw(&state.pool, ctx, body)
++                    .await?
++            }
++        },
+         Operation::Models => {
+             crate::transport::auxiliary::execute_models_raw(&state.pool, ctx).await?
+         }
+diff --git a/codex-rs/codex-transportd/src/transport/mod.rs b/codex-rs/codex-transportd/src/transport/mod.rs
+index 74b02f333..1d61a2264 100644
+--- a/codex-rs/codex-transportd/src/transport/mod.rs
++++ b/codex-rs/codex-transportd/src/transport/mod.rs
+@@ -12,5 +12,6 @@ pub mod metadata;
+ pub mod official_adapter;
+ pub mod proxy;
+ pub mod responses;
++pub mod responses_v3;
+ pub mod url_policy;
+ pub mod websocket;
+diff --git a/codex-rs/codex-transportd/src/transport/official_adapter.rs b/codex-rs/codex-transportd/src/transport/official_adapter.rs
+index e3ebf39a1..cf849838b 100644
+--- a/codex-rs/codex-transportd/src/transport/official_adapter.rs
++++ b/codex-rs/codex-transportd/src/transport/official_adapter.rs
+@@ -79,6 +79,30 @@ pub fn chatgpt_provider() -> Provider {
+     }
+ }
+ 
++/// v3（hookpoint=v3）专用 provider：与 [`chatgpt_provider`] 同 base/retry/
++/// idle timeout，但 **headers 为空**。
++///
++/// ★ 必需：`EndpointSession::make_request` 用
++/// `provider.build_request(...)` 起步，再 `req.headers.extend(extra_headers)`。
++/// `HeaderMap::extend` 对**同名键是替换**（`http` 1.4.0 `header/map.rs`
++/// `Extend<(Option<HeaderName>, T)>` 的 `Entry::Occupied` 分支 `e.insert(val)`），
++/// 但对 **provider 独有、Go 未交付的头则原样保留**。若沿用
++/// [`chatgpt_provider`]，provider 自带的 `version`（`CARGO_PKG_VERSION`）会在
++/// Go 未交付 `version` 时被 ctd 自行补上——**v3 下 ctd 不得做任何 header
++/// 决策**，那会变成 ctd 谎报自身构建版本。
++///
++/// 因此 v3 的头集**完全由 Go 决定**，provider 不得贡献任何默认头。
++pub fn chatgpt_provider_bare() -> Provider {
++    Provider {
++        name: "chatgpt".to_string(),
++        base_url: test_upstream_base_url(CHATGPT_CODEX_BASE_URL, "CTD_TEST_UPSTREAM_BASE_URL"),
++        query_params: None,
++        headers: HeaderMap::new(),
++        retry: official_retry(),
++        stream_idle_timeout: Duration::from_secs(300),
++    }
++}
++
+ /// 官方 WHAM provider（usage/quota）。
+ pub fn wham_provider() -> Provider {
+     Provider {
+@@ -217,6 +241,57 @@ mod tests {
+         assert_eq!(provider.base_url, "https://chatgpt.com/backend-api");
+     }
+ 
++    #[test]
++    fn bare_provider_contributes_no_default_headers() {
++        // ★ v3（hookpoint=v3）必需：EndpointSession::make_request 用
++        // provider.build_request 起步后 headers.extend(extra_headers)。
++        // extend 对同名键是**替换**，但 provider 独有、Go 未交付的头会原样
++        // 保留 ⇒ 非 bare provider 会让 ctd 在 v3 下自行补 version（谎报自身
++        // 构建版本）。bare provider 保证 v3 的头集完全由 Go 决定。
++        let bare = chatgpt_provider_bare();
++        assert!(bare.headers.is_empty(), "bare provider 不得携带任何默认头");
++        // 除默认头外与官方 provider 逐字段一致（同一 base/retry/idle）。
++        let official = chatgpt_provider();
++        assert_eq!(bare.base_url, official.base_url);
++        assert_eq!(bare.name, official.name);
++        assert_eq!(bare.retry.max_attempts, official.retry.max_attempts);
++        assert_eq!(bare.stream_idle_timeout, official.stream_idle_timeout);
++        // 官方 provider 恰好贡献 version（这正是 v3 必须绕开的那个头）。
++        assert_eq!(official.headers.len(), 1);
++        assert!(official.headers.contains_key("version"));
++    }
++
++    #[test]
++    fn v3_header_set_is_go_owned_not_provider_augmented() {
++        // 复现"若不换 bare provider 会发生什么"：Go 未交付 version 时，
++        // 官方 provider 会替 ctd 补一个 CARGO_PKG_VERSION。
++        let go_headers_without_version = http::HeaderMap::new();
++
++        let mut with_official = chatgpt_provider().headers.clone();
++        with_official.extend(go_headers_without_version.clone());
++        assert_eq!(
++            with_official.get("version").unwrap(),
++            env!("CARGO_PKG_VERSION"),
++            "非 bare provider 会在 Go 未交付时自补 version"
++        );
++
++        let mut with_bare = chatgpt_provider_bare().headers.clone();
++        with_bare.extend(go_headers_without_version);
++        assert!(with_bare.is_empty(), "bare provider 下头集完全由 Go 决定");
++
++        // 同名键的语义是**替换**（不是 append）：Go 交付的 version 覆盖 provider 的。
++        let mut go_headers = http::HeaderMap::new();
++        go_headers.insert("version", http::HeaderValue::from_static("0.159.2"));
++        let mut merged = chatgpt_provider().headers.clone();
++        merged.extend(go_headers.clone());
++        assert_eq!(merged.get_all("version").iter().count(), 1);
++        assert_eq!(merged.get("version").unwrap(), "0.159.2");
++
++        let mut merged = chatgpt_provider_bare().headers.clone();
++        merged.extend(go_headers);
++        assert_eq!(merged.get("version").unwrap(), "0.159.2");
++    }
++
+     #[test]
+     fn version_header_comes_from_package_version() {
+         let headers = official_version_header();
+diff --git a/codex-rs/codex-transportd/src/transport/responses_v3.rs b/codex-rs/codex-transportd/src/transport/responses_v3.rs
+new file mode 100644
+index 000000000..c0fd3625c
+--- /dev/null
++++ b/codex-rs/codex-transportd/src/transport/responses_v3.rs
+@@ -0,0 +1,617 @@
++//! v3（`X-CTD-Hookpoint: v3`）Responses 族**原样透传**适配（docs/20 §3.5 / §4.3 M5+M6）。
++//!
++//! v3 与 v1 是同一 ctd 二进制内的两套实现，共享同一 operation 集、同一 UDS
++//! 协议、同一响应形态（[`RawUpstreamResponse`]）与同一错误语义；差异**只在
++//! "请求如何被构造"这一层**：
++//!
++//! | | v1 | v3 |
++//! |---|---|---|
++//! | headers | Go 交付白名单**子集**，ctd 自派生其余 | Go 交付白名单**全集**，ctd 只做白名单过滤 |
++//! | body | ctd 解析 → 改投影 → `serde_json` 重编码 | Go 的**最终字节**，ctd 不解析不改写 |
++//! | `content-encoding` | ctd 权威，恒 identity | **Go 权威**，ctd 只校验 |
++//!
++//! ★ 边界处理（认证注入 / 超时 / 重试 / SSE 转发 / 审计）全部保留，且由
++//! 与 v1 **同一段**代码承担：认证注入在
++//! `codex-api/src/endpoint/session.rs` 的 `auth.apply_auth` 闭包内，重试走
++//! 同一官方 `run_with_request_telemetry_preserving_status`，SSE 仍是逐块
++//! 转发（不 parse / 不 re-serialize）。
++//!
++//! ★★ body 形态 ↔ `content-encoding` 一致性规则（docs/20 §3.3）
++//!
++//! | # | 规则 |
++//! |---|---|
++//! | R1 | `content-encoding` 与 body 编码由**同一权威**产生，ctd 结构上不可能制造不一致 |
++//! | R3 | v3：Go 是权威；ctd 用 `RequestBody::Raw(bytes)` + `RequestCompression::None` 原样发送，**既不写也不改** `content-encoding` / `content-type`（`codex-http-client/src/request.rs` 的 `Raw` 分支只 clone）。`Raw` + 压缩会直接报错 ⇒ 天然 fail closed |
++//! | R4 | ctd 做**形状校验**（审计，非决策）：`content-encoding` 若存在必须 ∈ [`V3_CONTENT_ENCODINGS`]，否则 `invalid_content_encoding` |
++//! | R5 | `host` / `content-length` / `accept-encoding` 是 ctd-owned 传输头：不在 [`V3_HEADER_ALLOWLIST`] ⇒ 即使 Go 误传也不进入出站集 |
++//! | R6 | `content-type` 必须由 Go 提供，ctd 不补；缺失 ⇒ `missing_v3_required_header` |
++//! | R7 | 灰度顺序先 identity 后 zstd；契约当天即允许 zstd（对齐官方只需改 Go 一处，ctd 零改动） |
++//!
++//! 本模块另外实现一条**比 R4 更强**的一致性检查（[`check_v3_body_encoding`]）：
++//! 声明 `zstd` ⇒ body 必须带 zstd frame magic；未声明 ⇒ body 不得带该 magic。
++//! 这是"上游解压失败"的唯一结构性防线——单靠闭集校验挡不住
++//! "Go 压了但忘写头"这一方向。
++
++use bytes::Bytes;
++use futures::StreamExt;
++use http::HeaderMap;
++
++use crate::contract::RawUpstreamResponse;
++use crate::contract::RequestContext;
++use crate::contract::error::ErrorClass;
++use crate::contract::error::ErrorPhase;
++use crate::contract::error::LocalError;
++use crate::contract::headers::V3_AUDIT_HEADERS;
++use crate::contract::headers::V3_CONTENT_ENCODINGS;
++use crate::contract::headers::V3_REQUIRED_HEADERS;
++use crate::contract::operation::Operation;
++use crate::transport::official_adapter;
++use crate::transport::responses::map_api_error;
++
++/// zstd frame magic（小端 `0xFD2FB528`）。
++pub const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
++
++/// v3 body 形态：由 Go 交付的 `content-encoding` 决定（ctd 只读不写）。
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum V3BodyEncoding {
++    /// 明文（无 `content-encoding`）——首期灰度形态（R7）。
++    Identity,
++    /// zstd 压缩体（`content-encoding: zstd`）——对齐官方 159.2 的形态。
++    Zstd,
++}
++
++impl V3BodyEncoding {
++    /// 闭集解析；未知值返回 `None`（调用方 fail closed）。
++    pub fn parse(value: &str) -> Option<Self> {
++        match value.trim().to_ascii_lowercase().as_str() {
++            "zstd" => Some(Self::Zstd),
++            _ => None,
++        }
++    }
++
++    pub fn as_str(&self) -> &'static str {
++        match self {
++            Self::Identity => "identity",
++            Self::Zstd => "zstd",
++        }
++    }
++}
++
++fn invalid_content_encoding(raw: &str) -> LocalError {
++    LocalError::new(
++        "invalid_content_encoding",
++        ErrorClass::Contract,
++        ErrorPhase::Validate,
++        false,
++        format!(
++            "v3 的 content-encoding 只允许 {:?}（或缺失 = identity），收到 {raw:?}",
++            V3_CONTENT_ENCODINGS
++        ),
++    )
++}
++
++fn audit_failed(message: impl Into<String>) -> LocalError {
++    LocalError::new(
++        "hookpoint_audit_failed",
++        ErrorClass::Contract,
++        ErrorPhase::Validate,
++        false,
++        message,
++    )
++}
++
++fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
++    headers
++        .get(name)
++        .and_then(|value| value.to_str().ok())
++        .unwrap_or("")
++}
++
++/// v3 必需头校验（R6）：`accept` / `content-type` 缺失 ⇒ 发出前 fail closed。
++///
++/// 理由：v3 下 ctd **不做 header 决策**（不补 `content-type`、不写 `accept`），
++/// 缺失即上游 4xx；必须在任何 upstream I/O 之前拦住。
++pub fn check_v3_required_headers(headers: &HeaderMap) -> Result<(), LocalError> {
++    for name in V3_REQUIRED_HEADERS {
++        let present = headers
++            .get(*name)
++            .map(|value| !value.is_empty())
++            .unwrap_or(false);
++        if !present {
++            return Err(LocalError::new(
++                "missing_v3_required_header",
++                ErrorClass::Contract,
++                ErrorPhase::Validate,
++                false,
++                format!("v3 要求 Go 交付完整出站头集：缺少必需头 {name}（ctd 不代补）"),
++            ));
++        }
++    }
++    Ok(())
++}
++
++/// 解析 Go 声明的 body 形态（R4 闭集校验，缺省 identity）。
++pub fn resolve_v3_body_encoding(headers: &HeaderMap) -> Result<V3BodyEncoding, LocalError> {
++    let Some(value) = headers.get("content-encoding") else {
++        return Ok(V3BodyEncoding::Identity);
++    };
++    let raw = value
++        .to_str()
++        .map_err(|_| invalid_content_encoding("<non-ascii>"))?;
++    V3BodyEncoding::parse(raw).ok_or_else(|| invalid_content_encoding(raw))
++}
++
++/// ★ body 形态 ↔ `content-encoding` 一致性（R1 的可执行形态）。
++///
++/// - 声明 `zstd` ⇒ body 必须以 zstd frame magic 开头；
++/// - 未声明（identity）⇒ body 不得以该 magic 开头。
++///
++/// 两个方向都 fail closed：前者挡住"写了头没压"，后者挡住"压了没写头"
++/// ——后者正是上游解压失败的直接成因。
++pub fn check_v3_body_encoding(
++    encoding: V3BodyEncoding,
++    body: &[u8],
++) -> Result<(), LocalError> {
++    let has_zstd_frame = body.len() >= ZSTD_FRAME_MAGIC.len() && body[..4] == ZSTD_FRAME_MAGIC;
++    match (encoding, has_zstd_frame) {
++        (V3BodyEncoding::Zstd, true) | (V3BodyEncoding::Identity, false) => Ok(()),
++        (V3BodyEncoding::Zstd, false) => Err(LocalError::new(
++            "content_encoding_body_mismatch",
++            ErrorClass::Contract,
++            ErrorPhase::Validate,
++            false,
++            "content-encoding=zstd 但 body 不含 zstd frame magic：形态与声明不一致",
++        )),
++        (V3BodyEncoding::Identity, true) => Err(LocalError::new(
++            "content_encoding_body_mismatch",
++            ErrorClass::Contract,
++            ErrorPhase::Validate,
++            false,
++            "body 带 zstd frame magic 但未声明 content-encoding：上游会按明文解压失败",
++        )),
++    }
++}
++
++/// v3 审计（docs/20 §3.5 项 1–4，+ docs/21 I2 的 thread-id 自洽）。
++///
++/// v3 不改变任何不变式的权威归属（全部仍在 Go 侧）——它只是去掉 ctd 的
++/// "二次取值"，把 ctd 从"共同权威"降为"纯消费者 + 审计者"。因此这些检查
++/// 是**确定性的廉价头内自洽检查**，失败即 fail closed（`hookpoint_audit_failed`）。
++///
++/// | # | 不变式 |
++/// |---|---|
++/// | 1 | `session-id` == `x-codex-turn-metadata.session_id` |
++/// | 2 | `thread-id` == `x-codex-turn-metadata.thread_id` |
++/// | 3 | `x-codex-window-id` == `x-codex-turn-metadata.window_id` |
++/// | 4 | `x-client-request-id` == `session-id` |
++/// | 5 | `x-codex-window-id` 后缀 == `x-codex-turn-metadata.window_number` |
++///
++/// 第 5 条（首轮 `turn_id == root_turn_id`）**不做**：ctd 无法判定"是否首轮"，
++/// 归 Go 侧责任（docs/20 §3.5）。
++///
++/// ★ 存在性要求（`V3_AUDIT_HEADERS` 全部必须存在）：这是对 **Go 交付契约**的
++/// 要求，不是对客户端的要求。v1 下 ctd 会从 session snapshot **合成**
++/// `x-codex-turn-metadata`（`compatibility_headers(&projection)`），v3 下 ctd
++/// 不合成 ⇒ 若某条 Go 出站路径没有交付这些头，v3 会在此 fail closed，而不是
++/// 把一个 ctd 无法背书的请求发出去。已知边界：raw passthrough 路径在**客户端
++/// 未发送** `x-codex-turn-metadata` 时不会合成该头
++/// （`rewriteCodexTurnMetadataFields` 对缺失头直接返回），此时 v3 会拒绝——
++/// 该请求类在 R-Go 直连下同样缺该头（只是少了元数据，不报错）。灰度时若命中，
++/// 应按"Go 交付不完整"处理（补 Go 侧合成），不得放宽本检查。
++pub fn audit_v3_headers(headers: &HeaderMap) -> Result<(), LocalError> {
++    for name in V3_AUDIT_HEADERS {
++        if !headers.contains_key(*name) {
++            return Err(audit_failed(format!(
++                "v3 审计失败：缺少审计头 {name}（Go 交付的完整出站头集不完整）"
++            )));
++        }
++    }
++
++    let session_id = header_str(headers, "session-id");
++    let thread_id = header_str(headers, "thread-id");
++    let window_id = header_str(headers, "x-codex-window-id");
++    let client_request_id = header_str(headers, "x-client-request-id");
++
++    let raw = header_str(headers, "x-codex-turn-metadata");
++    let parsed: serde_json::Value = serde_json::from_str(raw)
++        .map_err(|_| audit_failed("v3 审计失败：x-codex-turn-metadata 不是合法 JSON"))?;
++    let turn_metadata = parsed
++        .as_object()
++        .ok_or_else(|| audit_failed("v3 审计失败：x-codex-turn-metadata 不是 JSON object"))?;
++
++    let field = |name: &str| turn_metadata.get(name).and_then(|value| value.as_str());
++
++    if field("session_id") != Some(session_id) {
++        return Err(audit_failed(
++            "v3 审计失败：session-id 与 x-codex-turn-metadata.session_id 不同源",
++        ));
++    }
++    if field("thread_id") != Some(thread_id) {
++        return Err(audit_failed(
++            "v3 审计失败：thread-id 与 x-codex-turn-metadata.thread_id 不同源",
++        ));
++    }
++    if field("window_id") != Some(window_id) {
++        return Err(audit_failed(
++            "v3 审计失败：x-codex-window-id 与 x-codex-turn-metadata.window_id 不同源",
++        ));
++    }
++    if client_request_id != session_id {
++        return Err(audit_failed(
++            "v3 审计失败：x-client-request-id 与 session-id 不同值（官方不变式）",
++        ));
++    }
++    let window_number = turn_metadata
++        .get("window_number")
++        .and_then(|value| value.as_u64());
++    let window_suffix = window_id
++        .rsplit_once(':')
++        .and_then(|(_, suffix)| suffix.parse::<u64>().ok());
++    if window_number.is_none() || window_number != window_suffix {
++        return Err(audit_failed(
++            "v3 审计失败：x-codex-window-id 后缀与 x-codex-turn-metadata.window_number 不一致",
++        ));
++    }
++    Ok(())
++}
++
++/// v3 出站头集准备：白名单过滤 → 必需头 → body 形态一致性 → 审计。
++///
++/// 全部在任何 upstream I/O 之前完成；任一步失败即 fail closed（绝不静默
++/// 回落 v1 —— 回落会污染 A/B 观测，且与既有"rust_sidecar 无自动回退"
++/// 纪律冲突，docs/20 §2.5）。
++pub fn prepare_v3_headers(ctx: &RequestContext, body: &[u8]) -> Result<HeaderMap, LocalError> {
++    let headers = ctx.outbound_header_map();
++    check_v3_required_headers(&headers)?;
++    let encoding = resolve_v3_body_encoding(&headers)?;
++    check_v3_body_encoding(encoding, body)?;
++    audit_v3_headers(&headers)?;
++    Ok(headers)
++}
++
++/// 执行 v3 Responses HTTP/SSE 原样透传。
++pub async fn execute_responses_v3_raw(
++    pool: &crate::transport::client_pool::ClientPool,
++    ctx: &RequestContext,
++    body: Bytes,
++) -> Result<RawUpstreamResponse, LocalError> {
++    let headers = prepare_v3_headers(ctx, &body)?;
++
++    // capture 旁路：与 v1 同一入队点（校验通过后、发上游前）。
++    let capture_handle = crate::capture::begin(ctx);
++    if let Some(handle) = &capture_handle {
++        handle.send_request(&body);
++    }
++
++    let handle = official_adapter::resolve_route_handle(ctx.proxy_kind, ctx.proxy_url.as_ref())?;
++    let client = official_adapter::pooled_official_client(
++        pool,
++        &ctx.account_key,
++        &ctx.credential_revision,
++        &handle,
++        Operation::Responses,
++    )
++    .await?;
++    let auth = official_adapter::official_auth(ctx);
++    // ★ bare provider：v3 的头集完全由 Go 决定，provider 不得再贡献 version。
++    let provider = official_adapter::chatgpt_provider_bare();
++    let api_client =
++        codex_api::ResponsesClient::new(official_adapter::transport_for(client), provider, auth);
++
++    let outcome = api_client
++        .stream_raw_passthrough(body, headers)
++        .await
++        .map_err(|err| map_api_error(err, "responses"))?;
++    let stream = outcome.value;
++
++    let status = stream.status;
++    let headers = crate::contract::filter_upstream_headers(&stream.headers);
++    let body_stream = stream
++        .bytes
++        .map(|chunk| chunk.map_err(|err| std::io::Error::other(err.to_string())));
++
++    let body_stream: crate::contract::BodyStream = match capture_handle {
++        Some(handle) => Box::pin(crate::capture::CaptureStream::new(body_stream, handle)),
++        None => Box::pin(body_stream),
++    };
++
++    Ok(RawUpstreamResponse {
++        status,
++        headers,
++        body: Box::pin(body_stream),
++        attempt_count: u32::try_from(outcome.attempts).unwrap_or(u32::MAX),
++    })
++}
++
++/// 执行 v3 compact 原样透传（与 responses 同规则、同校验，只是 unary）。
++pub async fn execute_compact_v3_raw(
++    pool: &crate::transport::client_pool::ClientPool,
++    ctx: &RequestContext,
++    body: Bytes,
++) -> Result<RawUpstreamResponse, LocalError> {
++    let headers = prepare_v3_headers(ctx, &body)?;
++
++    let capture_handle = crate::capture::begin(ctx);
++    if let Some(handle) = &capture_handle {
++        handle.send_request(&body);
++    }
++
++    let handle = official_adapter::resolve_route_handle(ctx.proxy_kind, ctx.proxy_url.as_ref())?;
++    let client = official_adapter::pooled_official_client(
++        pool,
++        &ctx.account_key,
++        &ctx.credential_revision,
++        &handle,
++        Operation::ResponsesCompact,
++    )
++    .await?;
++    let auth = official_adapter::official_auth(ctx);
++    let provider = official_adapter::chatgpt_provider_bare();
++    let api_client =
++        codex_api::ResponsesClient::new(official_adapter::transport_for(client), provider, auth);
++
++    let outcome = api_client
++        .execute_raw_passthrough(
++            body,
++            headers,
++            crate::transport::compact::COMPACT_REQUEST_TIMEOUT,
++        )
++        .await
++        .map_err(|err| map_api_error(err, "compact"))?;
++    let response = outcome.value;
++
++    let status = response.status;
++    let headers = crate::contract::filter_upstream_headers(&response.headers);
++    let bytes = response.body;
++    // F10（review）：compact unary 响应体同样有界（与 v1 compact 一致）。
++    const MAX_UNARY_BODY: usize = 128 * 1024 * 1024;
++    if bytes.len() > MAX_UNARY_BODY {
++        return Err(LocalError::new(
++            "upstream_body_too_large",
++            ErrorClass::UpstreamProtocol,
++            ErrorPhase::StreamBody,
++            false,
++            format!(
++                "compact response body {} bytes exceeds unary limit {MAX_UNARY_BODY}",
++                bytes.len()
++            ),
++        ));
++    }
++
++    let body_stream: crate::contract::BodyStream = match capture_handle {
++        Some(handle) => Box::pin(crate::capture::CaptureStream::new(
++            futures::stream::once(Box::pin(async move { Ok::<_, std::io::Error>(bytes) })),
++            handle,
++        )),
++        None => Box::pin(futures::stream::once(Box::pin(async move {
++            Ok::<_, std::io::Error>(bytes)
++        }))),
++    };
++
++    Ok(RawUpstreamResponse {
++        status,
++        headers,
++        body: Box::pin(body_stream),
++        attempt_count: u32::try_from(outcome.attempts).unwrap_or(u32::MAX),
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::contract::headers::V3_HEADER_ALLOWLIST;
++
++    fn v3_headers(pairs: &[(&str, &str)]) -> HeaderMap {
++        let mut headers = HeaderMap::new();
++        for (name, value) in pairs {
++            headers.insert(
++                http::header::HeaderName::from_bytes(name.as_bytes()).expect("name"),
++                http::HeaderValue::from_str(value).expect("value"),
++            );
++        }
++        headers
++    }
++
++    /// 一份头内自洽的 v3 头集（官方 159.2 exec 形态，值已归一化）。
++    fn consistent_headers() -> HeaderMap {
++        let turn_metadata = r#"{"session_id":"0198f2b0-0000-7000-8000-000000000001","thread_id":"0198f2b0-0000-7000-8000-000000000002","window_id":"0198f2b0-0000-7000-8000-000000000002:1","window_number":1}"#;
++        v3_headers(&[
++            ("accept", "text/event-stream"),
++            ("content-type", "application/json"),
++            ("version", "0.159.2"),
++            ("session-id", "0198f2b0-0000-7000-8000-000000000001"),
++            ("thread-id", "0198f2b0-0000-7000-8000-000000000002"),
++            (
++                "x-client-request-id",
++                "0198f2b0-0000-7000-8000-000000000001",
++            ),
++            (
++                "x-codex-window-id",
++                "0198f2b0-0000-7000-8000-000000000002:1",
++            ),
++            ("x-codex-turn-metadata", turn_metadata),
++        ])
++    }
++
++    #[test]
++    fn required_headers_fail_closed_when_missing() {
++        let mut headers = consistent_headers();
++        headers.remove("content-type");
++        let err = check_v3_required_headers(&headers).expect_err("content-type 必需");
++        assert_eq!(err.code, "missing_v3_required_header");
++        assert_eq!(err.class, ErrorClass::Contract);
++        assert_eq!(err.phase, ErrorPhase::Validate);
++
++        let mut headers = consistent_headers();
++        headers.remove("accept");
++        let err = check_v3_required_headers(&headers).expect_err("accept 必需");
++        assert_eq!(err.code, "missing_v3_required_header");
++    }
++
++    #[test]
++    fn required_headers_pass_when_present() {
++        check_v3_required_headers(&consistent_headers()).expect("完整头集通过");
++    }
++
++    #[test]
++    fn content_encoding_closed_set() {
++        assert_eq!(
++            resolve_v3_body_encoding(&consistent_headers()).expect("identity"),
++            V3BodyEncoding::Identity
++        );
++        let headers = v3_headers(&[("content-encoding", "zstd")]);
++        assert_eq!(
++            resolve_v3_body_encoding(&headers).expect("zstd"),
++            V3BodyEncoding::Zstd
++        );
++        // 闭集之外一律 fail closed（ctd/上游链路未验证的编码不得透传）。
++        for bad in ["gzip", "br", "deflate", "identity", "zstd, gzip"] {
++            let headers = v3_headers(&[("content-encoding", bad)]);
++            let err = resolve_v3_body_encoding(&headers).expect_err(bad);
++            assert_eq!(err.code, "invalid_content_encoding", "{bad}");
++        }
++    }
++
++    #[test]
++    fn content_encoding_closed_set_matches_enum() {
++        // 闭集常量与枚举必须同步（新增编码时两处一起改）。
++        assert_eq!(V3_CONTENT_ENCODINGS, &["zstd"]);
++        for name in V3_CONTENT_ENCODINGS {
++            assert!(
++                V3BodyEncoding::parse(name).is_some(),
++                "闭集值 {name} 必须能被 V3BodyEncoding::parse 解析"
++            );
++        }
++        assert_eq!(V3BodyEncoding::Zstd.as_str(), "zstd");
++        assert_eq!(V3BodyEncoding::Identity.as_str(), "identity");
++    }
++
++    #[test]
++    fn body_encoding_consistency_both_directions() {
++        let plain = br#"{"model":"gpt-5"}"#;
++        let compressed = [ZSTD_FRAME_MAGIC.as_slice(), b"payload"].concat();
++
++        // 一致的两组通过。
++        check_v3_body_encoding(V3BodyEncoding::Identity, plain).expect("identity+明文");
++        check_v3_body_encoding(V3BodyEncoding::Zstd, &compressed).expect("zstd+压缩体");
++
++        // ★ "写了头没压"：上游解压失败。
++        let err = check_v3_body_encoding(V3BodyEncoding::Zstd, plain).expect_err("必须 fail closed");
++        assert_eq!(err.code, "content_encoding_body_mismatch");
++        assert_eq!(err.class, ErrorClass::Contract);
++        assert_eq!(err.phase, ErrorPhase::Validate);
++
++        // ★ "压了没写头"：上游按明文解压失败。
++        let err =
++            check_v3_body_encoding(V3BodyEncoding::Identity, &compressed).expect_err("必须 fail closed");
++        assert_eq!(err.code, "content_encoding_body_mismatch");
++
++        // 短 body 不越界读。
++        check_v3_body_encoding(V3BodyEncoding::Identity, &[0x28, 0xb5]).expect("短 body");
++        check_v3_body_encoding(V3BodyEncoding::Zstd, &[]).expect_err("空 body 不可能是 zstd frame");
++    }
++
++    #[test]
++    fn audit_accepts_consistent_headers() {
++        audit_v3_headers(&consistent_headers()).expect("自洽头集通过");
++    }
++
++    #[test]
++    fn audit_rejects_missing_audit_header() {
++        for name in V3_AUDIT_HEADERS {
++            let mut headers = consistent_headers();
++            headers.remove(*name);
++            let err = audit_v3_headers(&headers).expect_err(name);
++            assert_eq!(err.code, "hookpoint_audit_failed", "{name}");
++        }
++    }
++
++    #[test]
++    fn audit_rejects_header_body_disagreement() {
++        // I1：session-id 与 tm.session_id 不同源。
++        let mut headers = consistent_headers();
++        headers.insert(
++            "session-id",
++            http::HeaderValue::from_static("0198f2b0-0000-7000-8000-00000000dead"),
++        );
++        assert_eq!(
++            audit_v3_headers(&headers).expect_err("I1").code,
++            "hookpoint_audit_failed"
++        );
++
++        // I2：thread-id 不同源。
++        let mut headers = consistent_headers();
++        headers.insert(
++            "thread-id",
++            http::HeaderValue::from_static("0198f2b0-0000-7000-8000-00000000dead"),
++        );
++        assert_eq!(
++            audit_v3_headers(&headers).expect_err("I2").code,
++            "hookpoint_audit_failed"
++        );
++
++        // I3：x-codex-window-id 不同源。
++        let mut headers = consistent_headers();
++        headers.insert(
++            "x-codex-window-id",
++            http::HeaderValue::from_static("0198f2b0-0000-7000-8000-000000000002:2"),
++        );
++        assert_eq!(
++            audit_v3_headers(&headers).expect_err("I3").code,
++            "hookpoint_audit_failed"
++        );
++
++        // I4：x-client-request-id != session-id。
++        let mut headers = consistent_headers();
++        headers.insert(
++            "x-client-request-id",
++            http::HeaderValue::from_static("0198f2b0-0000-7000-8000-00000000dead"),
++        );
++        assert_eq!(
++            audit_v3_headers(&headers).expect_err("I4").code,
++            "hookpoint_audit_failed"
++        );
++
++        // I5：window 后缀与 window_number 不一致。
++        let mut headers = consistent_headers();
++        headers.insert(
++            "x-codex-turn-metadata",
++            http::HeaderValue::from_static(
++                r#"{"session_id":"0198f2b0-0000-7000-8000-000000000001","thread_id":"0198f2b0-0000-7000-8000-000000000002","window_id":"0198f2b0-0000-7000-8000-000000000002:1","window_number":7}"#,
++            ),
++        );
++        assert_eq!(
++            audit_v3_headers(&headers).expect_err("I5").code,
++            "hookpoint_audit_failed"
++        );
++
++        // turn-metadata 不是合法 JSON。
++        let mut headers = consistent_headers();
++        headers.insert(
++            "x-codex-turn-metadata",
++            http::HeaderValue::from_static("not-json"),
++        );
++        assert_eq!(
++            audit_v3_headers(&headers).expect_err("json").code,
++            "hookpoint_audit_failed"
++        );
++    }
++
++    #[test]
++    fn allowlist_excludes_transport_owned_and_credential_headers() {
++        // R5：ctd-owned 传输头与凭据头在结构上不可能进入 v3 出站集。
++        for name in [
++            "host",
++            "content-length",
++            "accept-encoding",
++            "authorization",
++            "chatgpt-account-id",
++            "cookie",
++        ] {
++            assert!(
++                !V3_HEADER_ALLOWLIST.contains(&name),
++                "{name} 不得进入 v3 白名单"
++            );
++        }
++    }
++}
+-- 
+2.48.1
+

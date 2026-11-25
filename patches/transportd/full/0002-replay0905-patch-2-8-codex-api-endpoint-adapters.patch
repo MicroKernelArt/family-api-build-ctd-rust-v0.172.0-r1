@@ -1,0 +1,513 @@
+From bb7a46bee6b44121e51e5ac4a51846326a912a8c Mon Sep 17 00:00:00 2001
+From: Shanks <shanks@book>
+Date: Mon, 7 Sep 2026 16:50:05 +0800
+Subject: [PATCH 02/37] replay0905-patch(2/8): codex-api endpoint adapters
+
+(cherry picked from commit 49cde2c56bf56639d18c3a94d057f10147963c28)
+---
+ codex-rs/codex-api/src/endpoint/models.rs     |  22 ++++
+ codex-rs/codex-api/src/endpoint/responses.rs  |  82 ++++++++++++-
+ .../src/endpoint/responses_websocket.rs       | 111 ++++++++++++++++++
+ codex-rs/codex-api/src/endpoint/search.rs     |  17 +++
+ codex-rs/codex-api/src/endpoint/session.rs    |  89 ++++++++++++++
+ codex-rs/codex-api/src/telemetry.rs           |  40 +++++++
+ .../codex-transportd/src/transport/compact.rs |   6 +-
+ 7 files changed, 363 insertions(+), 4 deletions(-)
+
+diff --git a/codex-rs/codex-api/src/endpoint/models.rs b/codex-rs/codex-api/src/endpoint/models.rs
+index c00bc0115..723156981 100644
+--- a/codex-rs/codex-api/src/endpoint/models.rs
++++ b/codex-rs/codex-api/src/endpoint/models.rs
+@@ -67,6 +67,28 @@ impl<T: HttpTransport> ModelsClient<T> {
+     }
+ 
+     /// Fetches and decodes a catalog, optionally bounding response bytes before decoding.
++    /// Raw models execution for the transport sidecar (TLS-CTD-001 FR-011).
++    ///
++    /// Returns the upstream status, headers and body bytes untouched so the
++    /// caller keeps its own models parsing/caching.
++    pub async fn execute_raw(
++        &self,
++        request_url: String,
++        extra_headers: HeaderMap,
++    ) -> Result<codex_client::Response, ApiError> {
++        self.session
++            .execute_with(
++                Method::GET,
++                Self::path(),
++                extra_headers,
++                /*body*/ None,
++                move |req| {
++                    req.url.clone_from(&request_url);
++                },
++            )
++            .await
++    }
++
+     pub async fn list_models(
+         &self,
+         request_url: String,
+diff --git a/codex-rs/codex-api/src/endpoint/responses.rs b/codex-rs/codex-api/src/endpoint/responses.rs
+index 9c41a802e..97b46e9f8 100644
+--- a/codex-rs/codex-api/src/endpoint/responses.rs
++++ b/codex-rs/codex-api/src/endpoint/responses.rs
+@@ -4,10 +4,10 @@ use crate::common::ResponsesApiRequest;
+ use crate::endpoint::session::EndpointSession;
+ use crate::error::ApiError;
+ use crate::provider::Provider;
+-use crate::requests::Compression;
+ use crate::requests::headers::build_session_headers;
+ use crate::requests::headers::insert_header;
+ use crate::requests::headers::subagent_header;
++use crate::requests::Compression;
+ use crate::sse::spawn_response_stream;
+ use crate::telemetry::SseTelemetry;
+ use codex_client::EncodedJsonBody;
+@@ -21,6 +21,7 @@ use http::Method;
+ use serde_json::Value;
+ use std::sync::Arc;
+ use std::sync::OnceLock;
++use std::time::Duration;
+ use tracing::instrument;
+ 
+ pub struct ResponsesClient<T: HttpTransport> {
+@@ -120,6 +121,85 @@ impl<T: HttpTransport> ResponsesClient<T> {
+             .await
+     }
+ 
++    /// Raw upstream Responses stream for the transport sidecar
++    /// (TLS-CTD-001 FR-011, R6 preservation).
++    ///
++    /// Returns the upstream status, headers and byte stream untouched — no SSE
++    /// parsing or re-serialization. Terminal non-2xx responses (e.g. 403, or
++    /// 429/5xx after the official retry budget) are returned as `Ok` with
++    /// their exact body and the real attempt count, so the sidecar can relay
++    /// them byte-for-byte with `x-ctd-origin: upstream`.
++    #[instrument(
++        name = "responses.stream_raw",
++        level = "info",
++        skip_all,
++        fields(
++            transport = "responses_http",
++            http.method = "POST",
++            api.path = "responses",
++            turn.has_state = turn_state.is_some()
++        )
++    )]
++    pub async fn stream_raw(
++        &self,
++        body: Value,
++        extra_headers: HeaderMap,
++        compression: Compression,
++        turn_state: Option<Arc<OnceLock<String>>>,
++    ) -> Result<codex_client::RawRetryOutcome<codex_client::StreamResponse>, ApiError> {
++        let body = EncodedJsonBody::encode(&body)
++            .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
++        let request_compression = match compression {
++            Compression::None => RequestCompression::None,
++            Compression::Zstd => RequestCompression::Zstd,
++        };
++        self.session
++            .stream_raw_with(
++                Method::POST,
++                "/responses",
++                extra_headers,
++                Some(body),
++                |req| {
++                    req.headers.insert(
++                        http::header::ACCEPT,
++                        HeaderValue::from_static("text/event-stream"),
++                    );
++                    req.compression = request_compression;
++                },
++            )
++            .await
++    }
++
++    /// Raw upstream compact execution for the transport sidecar
++    /// (TLS-CTD-001 FR-012, R6 preservation).
++    ///
++    /// Upstream removed the dedicated `CompactClient` when it dropped the
++    /// legacy remote compaction implementation; the `responses/compact` route is
++    /// owned by the responses client here. Returns the upstream status, headers
++    /// and body bytes untouched. Terminal non-2xx responses (e.g. 403, or
++    /// 429/5xx after the official retry budget) are returned as `Ok` with the
++    /// real attempt count. The caller (Go) decides window advance only on a
++    /// confirmed complete 2xx success; timeout/EOF/5xx/parse failure never
++    /// advance.
++    pub async fn execute_raw_compact(
++        &self,
++        body: Value,
++        extra_headers: HeaderMap,
++        request_timeout: Duration,
++    ) -> Result<codex_client::RawRetryOutcome<codex_client::Response>, ApiError> {
++        self.session
++            .execute_raw_with(
++                Method::POST,
++                "/responses/compact",
++                extra_headers,
++                Some(body),
++                |req| {
++                    req.timeout = Some(request_timeout);
++                },
++            )
++            .await
++    }
++
+     async fn stream_encoded(
+         &self,
+         body: EncodedJsonBody,
+diff --git a/codex-rs/codex-api/src/endpoint/responses_websocket.rs b/codex-rs/codex-api/src/endpoint/responses_websocket.rs
+index 77ed1ea60..54efe2130 100644
+--- a/codex-rs/codex-api/src/endpoint/responses_websocket.rs
++++ b/codex-rs/codex-api/src/endpoint/responses_websocket.rs
+@@ -15,6 +15,8 @@ use crate::sse::process_responses_event;
+ use crate::telemetry::WebsocketTelemetry;
+ use codex_client::TransportError;
+ use codex_http_client::HttpClientFactory;
++use codex_http_client::OutboundProxyPolicy;
++use codex_http_client::OutboundProxyRoute;
+ use codex_http_client::RetryAfter;
+ use codex_websocket_client::WebSocketConnection;
+ use codex_websocket_client::WebSocketConnector;
+@@ -445,6 +447,115 @@ impl ResponsesWebsocketClient {
+         .await
+     }
+ 
++    /// Connects the Responses WebSocket using an explicit sidecar-selected
++    /// proxy route (TLS-CTD-001 FR-016 / FR-017).
++    ///
++    /// Same URL/header/auth construction as [`Self::connect`] but the route is
++    /// pinned by the caller (per-account proxy route from Go); system
++    /// discovery and environment proxies are never consulted, and a proxy
++    /// failure never falls back to direct.
++    pub async fn connect_with_route(
++        &self,
++        proxy_route: OutboundProxyRoute,
++        extra_headers: HeaderMap,
++        default_headers: HeaderMap,
++        turn_state: Option<Arc<OnceLock<String>>>,
++        telemetry: Option<Arc<dyn WebsocketTelemetry>>,
++    ) -> Result<ResponsesWebsocketConnection, ApiError> {
++        let ws_url = self
++            .provider
++            .websocket_url_for_path("/responses")
++            .map_err(|err| ApiError::Stream(format!("failed to build websocket URL: {err}")))?;
++
++        let mut headers =
++            merge_request_headers(&self.provider.headers, extra_headers, default_headers);
++        self.auth.add_auth_headers(&mut headers);
++
++        let mut request = ws_url
++            .as_str()
++            .into_client_request()
++            .map_err(|err| ApiError::Stream(format!("failed to build websocket request: {err}")))?;
++        request.headers_mut().extend(headers);
++
++        // The route is explicit; the factory policy is never consulted by
++        // `connect_with_route` (it only supplies TLS config + custom CA).
++        let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
++        let connector = WebSocketConnector::new(&factory)
++            .map_err(|err| ApiError::Stream(format!("failed to configure websocket TLS: {err}")))?;
++        let (stream, response) = connector
++            .connect_with_route(request, websocket_config(), proxy_route)
++            .await
++            .map_err(|err| map_ws_error(err, &ws_url))?;
++
++        let reasoning_included = response.headers().contains_key(X_REASONING_INCLUDED_HEADER);
++        let models_etag = response
++            .headers()
++            .get(X_MODELS_ETAG_HEADER)
++            .and_then(|value| value.to_str().ok())
++            .map(ToString::to_string);
++        let _server_model = response
++            .headers()
++            .get(OPENAI_MODEL_HEADER)
++            .and_then(|value| value.to_str().ok())
++            .map(ToString::to_string);
++        if let Some(turn_state) = turn_state
++            && let Some(header_value) = response
++                .headers()
++                .get(X_CODEX_TURN_STATE_HEADER)
++                .and_then(|value| value.to_str().ok())
++        {
++            let _ = turn_state.set(header_value.to_string());
++        }
++        Ok(ResponsesWebsocketConnection::new(
++            WsStream::new(stream),
++            self.provider.stream_idle_timeout,
++            reasoning_included,
++            models_etag,
++            telemetry,
++        ))
++    }
++
++    /// Sidecar raw mode（P-015）：与 [`Self::connect_with_route`] 完全相同的
++    /// URL/header/auth/TLS/显式 route 构造，但返回原始
++    /// `WebSocketConnection` + 握手响应，不做 WsStream/telemetry 包装——
++    /// transportd 1:1 relay 需要原始帧通道。
++    pub async fn connect_raw_with_route(
++        &self,
++        proxy_route: OutboundProxyRoute,
++        extra_headers: HeaderMap,
++        default_headers: HeaderMap,
++    ) -> Result<
++        (
++            WebSocketConnection,
++            tokio_tungstenite::tungstenite::handshake::client::Response,
++        ),
++        ApiError,
++    > {
++        let ws_url = self
++            .provider
++            .websocket_url_for_path("/responses")
++            .map_err(|err| ApiError::Stream(format!("failed to build websocket URL: {err}")))?;
++
++        let mut headers =
++            merge_request_headers(&self.provider.headers, extra_headers, default_headers);
++        self.auth.add_auth_headers(&mut headers);
++
++        let mut request = ws_url
++            .as_str()
++            .into_client_request()
++            .map_err(|err| ApiError::Stream(format!("failed to build websocket request: {err}")))?;
++        request.headers_mut().extend(headers);
++
++        let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
++        let connector = WebSocketConnector::new(&factory)
++            .map_err(|err| ApiError::Stream(format!("failed to configure websocket TLS: {err}")))?;
++        let (stream, response) = connector
++            .connect_with_route(request, websocket_config(), proxy_route)
++            .await
++            .map_err(|err| map_ws_error(err, &ws_url))?;
++        Ok((stream, response))
++    }
++
+     /// Opens a WebSocket connection long enough to validate the upgrade response.
+     ///
+     /// The probe uses the same URL construction, headers, authentication, TLS,
+diff --git a/codex-rs/codex-api/src/endpoint/search.rs b/codex-rs/codex-api/src/endpoint/search.rs
+index 502e264b4..0e8d81586 100644
+--- a/codex-rs/codex-api/src/endpoint/search.rs
++++ b/codex-rs/codex-api/src/endpoint/search.rs
+@@ -31,6 +31,23 @@ impl<T: HttpTransport> SearchClient<T> {
+         }
+     }
+ 
++    fn path() -> &'static str {
++        "alpha/search"
++    }
++
++    /// Raw alpha-search execution for the transport sidecar (TLS-CTD-001 FR-011).
++    ///
++    /// Returns the upstream status, headers and body bytes untouched.
++    pub async fn execute_raw(
++        &self,
++        body: serde_json::Value,
++        extra_headers: HeaderMap,
++    ) -> Result<codex_client::Response, ApiError> {
++        self.session
++            .execute(Method::POST, Self::path(), extra_headers, Some(body))
++            .await
++    }
++
+     pub async fn search(
+         &self,
+         request: &SearchRequest,
+diff --git a/codex-rs/codex-api/src/endpoint/session.rs b/codex-rs/codex-api/src/endpoint/session.rs
+index 7849225b5..04260134f 100644
+--- a/codex-rs/codex-api/src/endpoint/session.rs
++++ b/codex-rs/codex-api/src/endpoint/session.rs
+@@ -2,8 +2,10 @@ use crate::auth::SharedAuthProvider;
+ use crate::error::ApiError;
+ use crate::provider::Provider;
+ use crate::telemetry::run_with_request_telemetry;
++use crate::telemetry::run_with_request_telemetry_preserving_status;
+ use codex_client::EncodedJsonBody;
+ use codex_client::HttpTransport;
++use codex_client::RawRetryOutcome;
+ use codex_client::Request;
+ use codex_client::RequestBody;
+ use codex_client::RequestTelemetry;
+@@ -153,4 +155,91 @@ impl<T: HttpTransport> EndpointSession<T> {
+ 
+         Ok(stream)
+     }
++
++    /// raw unary 形态（transportd R6）：任何 status 的响应原样返回
++    /// （terminal non-2xx 不映射为 `ApiError`），并携带官方 retry 后的
++    /// 真实 attempt 次数。重试语义与 [`Self::execute_with`] 一致。
++    #[instrument(
++        name = "endpoint_session.execute_raw_with",
++        level = "info",
++        skip_all,
++        fields(http.method = %method, api.path = path)
++    )]
++    pub(crate) async fn execute_raw_with<C>(
++        &self,
++        method: Method,
++        path: &str,
++        extra_headers: HeaderMap,
++        body: Option<Value>,
++        configure: C,
++    ) -> Result<RawRetryOutcome<Response>, ApiError>
++    where
++        C: Fn(&mut Request),
++    {
++        let body = body.map(RequestBody::Json);
++        let make_request = || {
++            let mut req = self.make_request(&method, path, &extra_headers, body.as_ref());
++            configure(&mut req);
++            req
++        };
++
++        run_with_request_telemetry_preserving_status(
++            self.provider.retry.to_policy(),
++            self.request_telemetry.clone(),
++            make_request,
++            |req| {
++                let auth = self.auth.clone();
++                let transport = &self.transport;
++                async move {
++                    let req = auth.apply_auth(req).await.map_err(TransportError::from)?;
++                    transport.execute_preserving_status(req).await
++                }
++            },
++        )
++        .await
++        .map_err(ApiError::from)
++    }
++
++    /// raw 流式形态（transportd R6）：terminal non-2xx 以 `Ok` 返回且
++    /// body 可逐块读取；attempt 次数真实。重试语义与
++    /// [`Self::stream_encoded_json_with`] 一致。
++    #[instrument(
++        name = "endpoint_session.stream_raw_with",
++        level = "info",
++        skip_all,
++        fields(http.method = %method, api.path = path)
++    )]
++    pub(crate) async fn stream_raw_with<C>(
++        &self,
++        method: Method,
++        path: &str,
++        extra_headers: HeaderMap,
++        body: Option<EncodedJsonBody>,
++        configure: C,
++    ) -> Result<RawRetryOutcome<StreamResponse>, ApiError>
++    where
++        C: Fn(&mut Request),
++    {
++        let body = body.map(RequestBody::EncodedJson);
++        let mut request = self.make_request(&method, path, &extra_headers, body.as_ref());
++        configure(&mut request);
++        let request = request.into_prepared().map_err(TransportError::Build)?;
++        let make_request = || request.clone();
++
++        run_with_request_telemetry_preserving_status(
++            self.provider.retry.to_policy(),
++            self.request_telemetry.clone(),
++            make_request,
++            |req| {
++                let auth = self.auth.clone();
++                let transport = &self.transport;
++                async move {
++                    let req = auth.apply_auth(req).await.map_err(TransportError::from)?;
++                    transport.stream_preserving_status(req).await
++                }
++            },
++        )
++        .await
++        .map_err(ApiError::from)
++    }
+ }
+diff --git a/codex-rs/codex-api/src/telemetry.rs b/codex-rs/codex-api/src/telemetry.rs
+index 91918a65b..fd7896fd7 100644
+--- a/codex-rs/codex-api/src/telemetry.rs
++++ b/codex-rs/codex-api/src/telemetry.rs
+@@ -1,4 +1,5 @@
+ use crate::error::ApiError;
++use codex_client::RawRetryOutcome;
+ use codex_client::Request;
+ use codex_client::RequestTelemetry;
+ use codex_client::Response;
+@@ -6,6 +7,7 @@ use codex_client::RetryPolicy;
+ use codex_client::StreamResponse;
+ use codex_client::TransportError;
+ use codex_client::run_with_retry;
++use codex_client::run_with_retry_preserving_status;
+ use http::StatusCode;
+ use std::future::Future;
+ use std::sync::Arc;
+@@ -96,3 +98,41 @@ where
+     })
+     .await
+ }
++
++/// raw 形态（transportd R6）：与 [`run_with_request_telemetry`] 相同的
++/// per-attempt telemetry，但 retryable 状态按官方 policy 重试后，终态
++/// 响应（含非 2xx）原样返回并携带真实 attempt 次数。
++pub(crate) async fn run_with_request_telemetry_preserving_status<T, F, Fut>(
++    policy: RetryPolicy,
++    telemetry: Option<Arc<dyn RequestTelemetry>>,
++    make_request: impl FnMut() -> Request,
++    send: F,
++) -> Result<RawRetryOutcome<T>, TransportError>
++where
++    T: WithStatus,
++    F: Clone + Fn(Request) -> Fut,
++    Fut: Future<Output = Result<T, TransportError>>,
++{
++    run_with_retry_preserving_status(
++        policy,
++        make_request,
++        move |req, attempt| {
++            let telemetry = telemetry.clone();
++            let send = send.clone();
++            async move {
++                let start = Instant::now();
++                let result = send(req).await;
++                if let Some(t) = telemetry.as_ref() {
++                    let (status, err) = match &result {
++                        Ok(resp) => (Some(resp.status()), None),
++                        Err(err) => (http_status(err), Some(err)),
++                    };
++                    t.on_request(attempt, status, err, start.elapsed());
++                }
++                result
++            }
++        },
++        |value| Some(value.status()),
++    )
++    .await
++}
+diff --git a/codex-rs/codex-transportd/src/transport/compact.rs b/codex-rs/codex-transportd/src/transport/compact.rs
+index cd982c627..12eb4ce48 100644
+--- a/codex-rs/codex-transportd/src/transport/compact.rs
++++ b/codex-rs/codex-transportd/src/transport/compact.rs
+@@ -1,6 +1,6 @@
+ //! Compact 原始适配（TLS-CTD-001 §12.2 / FR-012）。
+ //!
+-//! Rust 只执行官方 raw compact（`CompactClient::execute_raw`）并原样返回
++//! Rust 只执行官方 raw compact（`ResponsesClient::execute_raw_compact`）并原样返回
+ //! upstream status/headers/body；window advance 由 Go 在完整成功判定后
+ //! 执行（Rust 绝不推进 Go window）。
+ 
+@@ -86,12 +86,12 @@ pub async fn execute_compact_raw(
+     let auth = official_adapter::official_auth(ctx);
+     let provider = official_adapter::chatgpt_provider();
+     let api_client =
+-        codex_api::CompactClient::new(official_adapter::transport_for(client), provider, auth);
++        codex_api::ResponsesClient::new(official_adapter::transport_for(client), provider, auth);
+ 
+     // R6（R-TRANSPORT-001）：terminal non-2xx 原样保留（不映射为本地
+     // 错误→502），attempt 次数来自官方 retry 循环的真实值。
+     let outcome = api_client
+-        .execute_raw(value, headers, COMPACT_REQUEST_TIMEOUT, None)
++        .execute_raw_compact(value, headers, COMPACT_REQUEST_TIMEOUT)
+         .await
+         .map_err(|err| responses::map_api_error(err, "compact"))?;
+     let response = outcome.value;
+-- 
+2.48.1
+

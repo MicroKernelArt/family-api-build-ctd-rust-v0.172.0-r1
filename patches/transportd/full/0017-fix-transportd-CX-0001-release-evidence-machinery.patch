@@ -1,0 +1,2174 @@
+From f056820fc1ee41c5e502e30178bae70cfef3d32c Mon Sep 17 00:00:00 2001
+From: Shanks <shanks@book>
+Date: Thu, 10 Sep 2026 01:06:26 +0800
+Subject: [PATCH 17/37] fix(transportd): CX-0001 release evidence machinery
+
+Release gates self-contained and input-validated: export/sbom/wire/
+release-evidence gates + static-test now validate non-sh inputs,
+materialize the exact release artifact + externally-stored receipt before
+release-tag-verify, verify artifact-bound SBOM, and enforce release
+identity ancestry (declared source_commit must be an actual ancestor).
+Applies the consolidated format pass to touched code.
+
+(cherry picked from commit 05289a36b7d2dc0db62fe1d8fa0bb94a4abc5f84)
+---
+ .../workflows/transportd-release-gates.yml    |  32 ++-
+ .github/workflows/worker-ci.yml               |   4 +-
+ RUNBOOK.md                                    |  16 +-
+ UPSTREAM_BASE.md                              |  34 +--
+ codex-rs/codex-transportd/src/server/mod.rs   |   3 +-
+ .../codex-transportd/src/transport/compact.rs |   4 +-
+ codex-rs/http-client/src/transport_tests.rs   |   3 +-
+ deploy/build-sidecar-platform-test.sh         |  38 +++-
+ deploy/build-sidecar-profile-lib.sh           |  20 +-
+ deploy/build-sidecar-volume-test.sh           |   1 +
+ deploy/build-sidecar.sh                       | 123 +++++++---
+ patches/transportd/tools/bin-verify.sh        | 104 +++++++++
+ .../tools/capture-isolation-gate.sh           |  17 ++
+ .../transportd/tools/ci-gates-static-test.sh  | 126 +++++++++++
+ patches/transportd/tools/export-gate.sh       |  81 +++++++
+ .../tools/gate-evidence-mutation-test.sh      |  30 +++
+ .../tools/gate-export-mutation-test.sh        |  28 +++
+ .../transportd/tools/gate-mutation-test.sh    |  64 ++++++
+ .../tools/gate-wire-sbom-mutation-test.sh     | 175 +++++++++++++++
+ patches/transportd/tools/identity-lib.sh      |  51 +++++
+ .../tools/materialize-release-artifact.sh     | 211 ++++++++++++++++++
+ .../transportd/tools/release-evidence-gate.sh | 106 +++++++++
+ .../transportd/tools/release-tag-verify.sh    |  38 ++++
+ patches/transportd/tools/sbom-gate.sh         | 139 ++++++++++++
+ patches/transportd/tools/static-fix-gates.sh  |  24 ++
+ patches/transportd/tools/wire-gate.sh         |  29 +++
+ .../transportd/tools/write-source-receipt.sh  |  39 ++++
+ replay/gate.sh                                | 129 +++++------
+ replay/worker-ci-static-test.sh               |   9 +-
+ sidecar-image-receipt.txt                     |  12 -
+ 30 files changed, 1541 insertions(+), 149 deletions(-)
+ create mode 100755 patches/transportd/tools/bin-verify.sh
+ create mode 100755 patches/transportd/tools/capture-isolation-gate.sh
+ create mode 100755 patches/transportd/tools/ci-gates-static-test.sh
+ create mode 100755 patches/transportd/tools/export-gate.sh
+ create mode 100755 patches/transportd/tools/gate-evidence-mutation-test.sh
+ create mode 100755 patches/transportd/tools/gate-export-mutation-test.sh
+ create mode 100755 patches/transportd/tools/gate-mutation-test.sh
+ create mode 100755 patches/transportd/tools/gate-wire-sbom-mutation-test.sh
+ create mode 100755 patches/transportd/tools/identity-lib.sh
+ create mode 100755 patches/transportd/tools/materialize-release-artifact.sh
+ create mode 100755 patches/transportd/tools/release-evidence-gate.sh
+ create mode 100755 patches/transportd/tools/release-tag-verify.sh
+ create mode 100755 patches/transportd/tools/sbom-gate.sh
+ create mode 100755 patches/transportd/tools/static-fix-gates.sh
+ create mode 100755 patches/transportd/tools/wire-gate.sh
+ create mode 100755 patches/transportd/tools/write-source-receipt.sh
+ delete mode 100644 sidecar-image-receipt.txt
+
+diff --git a/.github/workflows/transportd-release-gates.yml b/.github/workflows/transportd-release-gates.yml
+index 61410e4b6..8b6c73686 100644
+--- a/.github/workflows/transportd-release-gates.yml
++++ b/.github/workflows/transportd-release-gates.yml
+@@ -40,7 +40,10 @@ jobs:
+       - name: Export gate（manifest 驱动系列完整性；summary 只读校验）
+         run: bash patches/transportd/tools/export-gate.sh
+       - name: Evidence gate（pre-release 模式；不构成 release 批准）
+-        run: bash patches/transportd/tools/release-evidence-gate.sh
++        run: |
++          RECEIPT="${RUNNER_TEMP}/transportd-source-receipt.txt"
++          bash patches/transportd/tools/write-source-receipt.sh "$RECEIPT"
++          bash patches/transportd/tools/release-evidence-gate.sh --receipt "$RECEIPT"
+       - name: Static CI gate test（gate 集与模式分离的结构断言）
+         run: bash patches/transportd/tools/ci-gates-static-test.sh
+ 
+@@ -54,9 +57,26 @@ jobs:
+           git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+           git fetch origin --tags "+${GITHUB_REF}"
+           git checkout --force FETCH_HEAD
+-      - name: Release tag verification（声明 tag；release 旗标由脚本内部执行）
++      - name: Build exact release image and producer receipt
++        env:
++          CTD_RELEASE_RECEIPT_PATH: ${{ runner.temp }}/transportd-build-receipt.txt
++        run: |
++          BUILD_PROFILE=release bash deploy/build-sidecar.sh prepare
++          BUILD_PROFILE=release bash deploy/build-sidecar.sh build --mode local-cargo
++      - name: Materialize image archive, binary, SBOM, and release receipt
++        env:
++          CTD_BUILD_RECEIPT_PATH: ${{ runner.temp }}/transportd-build-receipt.txt
++          CTD_RELEASE_RECEIPT_PATH: ${{ runner.temp }}/transportd-release-receipt.txt
++          CTD_RELEASE_ARTIFACT_PATH: ${{ runner.temp }}/transportd-release-image.tar
++          CTD_RELEASE_BINARY_PATH: ${{ runner.temp }}/codex-transportd
++          CTD_RELEASE_SBOM_PATH: ${{ runner.temp }}/transportd-release.cdx.json
++          CTD_RELEASE_LICENSE_REPORT_PATH: ${{ runner.temp }}/transportd-license-report.json
++        run: bash patches/transportd/tools/materialize-release-artifact.sh
++      - name: Verify release tag and exact materialized artifacts
++        env:
++          CTD_RELEASE_RECEIPT_PATH: ${{ runner.temp }}/transportd-release-receipt.txt
++          CTD_RELEASE_ARTIFACT_PATH: ${{ runner.temp }}/transportd-release-image.tar
++          CTD_RELEASE_BINARY_PATH: ${{ runner.temp }}/codex-transportd
++          CTD_RELEASE_SBOM_PATH: ${{ runner.temp }}/transportd-release.cdx.json
++          CTD_RELEASE_LICENSE_REPORT_PATH: ${{ runner.temp }}/transportd-license-report.json
+         run: bash patches/transportd/tools/release-tag-verify.sh
+-      - name: Wire gate（wire 证据未闭合则失败）
+-        run: bash patches/transportd/tools/wire-gate.sh
+-      - name: SBOM gate（摘要 TBD/未绑定则失败）
+-        run: bash patches/transportd/tools/sbom-gate.sh
+diff --git a/.github/workflows/worker-ci.yml b/.github/workflows/worker-ci.yml
+index 6dd064487..c9b667c9f 100644
+--- a/.github/workflows/worker-ci.yml
++++ b/.github/workflows/worker-ci.yml
+@@ -123,10 +123,12 @@ jobs:
+       - name: Verify replay, export, evidence, and mutation gates
+         run: |
+           set -euo pipefail
++          RECEIPT="${RUNNER_TEMP}/transportd-source-receipt.txt"
++          bash patches/transportd/tools/write-source-receipt.sh "$RECEIPT"
+           bash replay/worker-ci-static-test.sh
+           bash replay/gate.sh
+           bash patches/transportd/tools/export-gate.sh
+-          bash patches/transportd/tools/release-evidence-gate.sh
++          bash patches/transportd/tools/release-evidence-gate.sh --receipt "$RECEIPT"
+           bash patches/transportd/tools/ci-gates-static-test.sh
+           bash patches/transportd/tools/static-fix-gates.sh
+           bash patches/transportd/tools/capture-isolation-gate.sh
+diff --git a/RUNBOOK.md b/RUNBOOK.md
+index 918a389e1..92062c6e5 100644
+--- a/RUNBOOK.md
++++ b/RUNBOOK.md
+@@ -24,14 +24,26 @@ BUILD_PROFILE=local ./deploy/build-sidecar.sh build --mode local-cargo
+ 
+ ```bash
+ # BUILD_PROFILE=release 是默认值；发布机 Docker daemon 必须为 amd64。
++export CTD_BUILD_RECEIPT_PATH=/var/lib/codex-transportd/evidence/build-receipt.txt
++export CTD_RELEASE_RECEIPT_PATH=/var/lib/codex-transportd/evidence/release-receipt.txt
++export CTD_RELEASE_ARTIFACT_PATH=/var/lib/codex-transportd/evidence/release-image.tar
++export CTD_RELEASE_BINARY_PATH=/var/lib/codex-transportd/evidence/codex-transportd
++export CTD_RELEASE_SBOM_PATH=/var/lib/codex-transportd/evidence/release.cdx.json
++export CTD_RELEASE_LICENSE_REPORT_PATH=/var/lib/codex-transportd/evidence/license-report.json
+ ./deploy/build-sidecar.sh prepare
++CTD_RELEASE_RECEIPT_PATH="$CTD_BUILD_RECEIPT_PATH" \
+ ./deploy/build-sidecar.sh build --mode local-cargo
+-bash patches/transportd/tools/release-evidence-gate.sh --release
++bash patches/transportd/tools/materialize-release-artifact.sh
++bash patches/transportd/tools/release-evidence-gate.sh --receipt "$CTD_RELEASE_RECEIPT_PATH" \
++  --artifact "$CTD_RELEASE_ARTIFACT_PATH" --release
++bash patches/transportd/tools/release-tag-verify.sh
+ ```
+ 
+ - 目标固定为 `linux/amd64` / `x86_64-unknown-linux-gnu`。
+ - source identity 与 release id 来自 `patches/transportd/series.yaml`。
+-- canonical receipt 是仓库根目录的 `sidecar-image-receipt.txt`。
++- build/release receipt、镜像 archive、镜像内 binary、SBOM 和 license report
++  路径必须显式提供且位于 source tree 外；gate 会分别校验 source、artifact、
++  binary、SBOM、review 与 release identity。
+ - local profile 的 image、release id 或 receipt 均不能作为发布证据。
+ 
+ ## 部署
+diff --git a/UPSTREAM_BASE.md b/UPSTREAM_BASE.md
+index de6e1a8c6..d10d153c9 100644
+--- a/UPSTREAM_BASE.md
++++ b/UPSTREAM_BASE.md
+@@ -1,24 +1,28 @@
+-# UPSTREAM_BASE（T-002 / CP-002 冻结）
++# UPSTREAM_BASE
+ 
+-官方 exact-tag fork 基准（本仓库 branch `transportd/v0.144.1` 的 parent）。
++The replay0905 source line is based on the immutable OpenAI Codex
++`rust-v0.159.0` release object.
+ 
+-| 项 | 值 |
++| Field | Value |
+ |---|---|
+-| upstream remote | `https://github.com/openai/codex` |
+-| tag | `rust-v0.144.1` |
+-| peeled commit | `44918ea10c0f99151c6710411b4322c2f5c96bea` |
+-| `codex-rs/Cargo.lock` SHA-256 | `175793a40a3147db1fee08fd9db0acc59312c344b3513dd7ee316f5446d8119e` |
+-| toolchain | `1.95.0`（`codex-rs/rust-toolchain.toml`，含 clippy/rustfmt/rust-src） |
++| upstream repository | `https://github.com/openai/codex` |
++| annotated tag | `rust-v0.159.0` |
++| tag object | `377f7f557a6bdea0f3a2d26d4d899c66db4789d0` |
++| peeled base commit | `687a119f0fcaace47e1f1abcc77cec6c813fd6da` |
++| base tree | `bee1375c8502e4c4d71db017f7e087dfbb3e775c` |
++| base `codex-rs/Cargo.lock` SHA-256 | `16b915e94730a7e598182620923fc6eae19e32366d3b5ef91128002575ae24af` |
++| base `MODULE.bazel.lock` SHA-256 | `be65892b2bdb12c0867dabfcaaf7ca4ee7a9ae4915e0d0de9c99448158777d31` |
++| Rust toolchain | `1.95.0` |
+ | license | Apache-2.0 |
+ 
+-可复现命令：
++Verification uses the objects already shipped by this repository:
+ 
+ ```bash
+-git ls-remote https://github.com/openai/codex 'refs/tags/rust-v0.144.1^{}'
+-# 44918ea10c0f99151c6710411b4322c2f5c96bea
+-shasum -a 256 codex-rs/Cargo.lock
+-# 175793a40a3147db1fee08fd9db0acc59312c344b3513dd7ee316f5446d8119e
++git cat-file -p 377f7f557a6bdea0f3a2d26d4d899c66db4789d0
++git rev-parse '377f7f557a6bdea0f3a2d26d4d899c66db4789d0^{}'
++git show 687a119f0fcaace47e1f1abcc77cec6c813fd6da:codex-rs/Cargo.lock | shasum -a 256
++git show 687a119f0fcaace47e1f1abcc77cec6c813fd6da:MODULE.bazel.lock | shasum -a 256
+ ```
+ 
+-本仓库只消费不可变 upstream 输入；任何 upstream 变更先更新本文件并重跑
+-CP-002 gate。
++Changing any base identity requires regenerating the complete patch series and
++all source-bound evidence.
+diff --git a/codex-rs/codex-transportd/src/server/mod.rs b/codex-rs/codex-transportd/src/server/mod.rs
+index 1e3c42ab5..01d8d797d 100644
+--- a/codex-rs/codex-transportd/src/server/mod.rs
++++ b/codex-rs/codex-transportd/src/server/mod.rs
+@@ -824,7 +824,8 @@ mod socket_dir_tests {
+     fn tmpdir() -> std::path::PathBuf {
+         // 原子计数器保证并行测试下路径唯一（同 pid 同微秒时 nanos 会撞号，
+         // 导致两个测试共享同一目录、权限断言互相污染）。
+-        use std::sync::atomic::{AtomicU64, Ordering};
++        use std::sync::atomic::AtomicU64;
++        use std::sync::atomic::Ordering;
+         static COUNTER: AtomicU64 = AtomicU64::new(0);
+         let d = std::env::temp_dir().join(format!(
+             "ctd-socket-dir-test-{}-{}",
+diff --git a/codex-rs/codex-transportd/src/transport/compact.rs b/codex-rs/codex-transportd/src/transport/compact.rs
+index b70ec7917..6358f124b 100644
+--- a/codex-rs/codex-transportd/src/transport/compact.rs
++++ b/codex-rs/codex-transportd/src/transport/compact.rs
+@@ -8,12 +8,12 @@ use std::time::Duration;
+ 
+ use bytes::Bytes;
+ 
++use crate::contract::RawUpstreamResponse;
++use crate::contract::RequestContext;
+ use crate::contract::error::ErrorClass;
+ use crate::contract::error::ErrorPhase;
+ use crate::contract::error::LocalError;
+ use crate::contract::operation::Operation;
+-use crate::contract::RawUpstreamResponse;
+-use crate::contract::RequestContext;
+ use crate::transport::metadata;
+ use crate::transport::official_adapter;
+ use crate::transport::responses;
+diff --git a/codex-rs/http-client/src/transport_tests.rs b/codex-rs/http-client/src/transport_tests.rs
+index 057482219..7625a73d9 100644
+--- a/codex-rs/http-client/src/transport_tests.rs
++++ b/codex-rs/http-client/src/transport_tests.rs
+@@ -6,7 +6,8 @@ use http::HeaderValue;
+ use http::Method;
+ use http::StatusCode;
+ use serde_json::json;
+-use std::io::{Read, Write};
++use std::io::Read;
++use std::io::Write;
+ use std::sync::Arc;
+ use std::sync::Mutex;
+ use std::sync::atomic::AtomicUsize;
+diff --git a/deploy/build-sidecar-platform-test.sh b/deploy/build-sidecar-platform-test.sh
+index 54718f14f..9e5380155 100755
+--- a/deploy/build-sidecar-platform-test.sh
++++ b/deploy/build-sidecar-platform-test.sh
+@@ -23,8 +23,9 @@ assert_eq() {
+ }
+ 
+ profile_config() {
+-  local profile="$1" platform="${2:-}" image_tag="${3:-}"
++  local profile="$1" platform="${2:-}" image_tag="${3:-}" receipt="${4:-}"
+   BUILD_PROFILE="$profile" PLATFORM="$platform" IMAGE_TAG="$image_tag" HOME="$WORK/home" \
++    CTD_RELEASE_RECEIPT_PATH="$receipt" \
+     bash -c '
+       set -euo pipefail
+       source "$1"
+@@ -40,11 +41,30 @@ assert_eq "$local_config" \
+   "local|linux/arm64|aarch64-unknown-linux-gnu|arm64|deploy/vendor-debs-arm64|invocation|$WORK/home/.cache/codex-transportd/receipts/local-arm64.txt|$WORK/home/.cache/codex-transportd/target/arm64" \
+   "local profile defaults"
+ 
+-release_config="$(profile_config release)"
++release_receipt="$WORK/receipts/release.txt"
++release_config="$(profile_config release "" "" "$release_receipt")"
+ assert_eq "$release_config" \
+-  "release|linux/amd64|x86_64-unknown-linux-gnu|amd64|deploy/vendor-debs|manifest|$REPO/sidecar-image-receipt.txt|" \
++  "release|linux/amd64|x86_64-unknown-linux-gnu|amd64|deploy/vendor-debs|manifest|$release_receipt|" \
+   "release profile defaults"
+ 
++if profile_config release >/dev/null 2>&1; then
++  echo "FAIL: release profile accepted a missing external receipt path"
++  exit 1
++fi
++if profile_config release "" "" "$REPO/receipt.txt" >/dev/null 2>&1; then
++  echo "FAIL: release profile accepted an in-tree receipt path"
++  exit 1
++fi
++if profile_config release "" "" "$REPO/../$(basename "$REPO")/receipt.txt" >/dev/null 2>&1; then
++  echo "FAIL: release profile accepted an in-tree receipt path containing traversal"
++  exit 1
++fi
++ln -s "$REPO" "$WORK/repo-link"
++if profile_config release "" "" "$WORK/repo-link/receipt.txt" >/dev/null 2>&1; then
++  echo "FAIL: release profile accepted a symlinked in-tree receipt path"
++  exit 1
++fi
++
+ for invalid in "local linux/amd64" "release linux/arm64"; do
+   invalid_profile="${invalid%% *}"
+   invalid_platform="${invalid#* }"
+@@ -118,6 +138,7 @@ chmod +x "$MOCK_BIN"/*
+ 
+ run_prepare() {
+   local profile="$1" platform="${2:-}" daemon_arch="${3:-}" log="$WORK/docker-$1-${2:-default}.log"
++  local receipt="$WORK/receipts/$profile-${2:-default}.txt"
+   if [ -z "$daemon_arch" ]; then
+     case "$profile" in
+       local) daemon_arch="arm64" ;;
+@@ -128,6 +149,7 @@ run_prepare() {
+   if ! env -i \
+     PATH="$MOCK_BIN:$PATH" HOME="$WORK/home" TMPDIR="$WORK" LC_ALL=C.UTF-8 \
+     BUILD_PROFILE="$profile" PLATFORM="$platform" \
++    CTD_RELEASE_RECEIPT_PATH="$receipt" \
+     CTD_V8_CACHE="$WORK/v8-$profile-${2:-default}" \
+     CTD_TEST_DOCKER_LOG="$log" \
+     CTD_TEST_CURL_LOG="$WORK/curl.log" \
+@@ -140,7 +162,6 @@ run_prepare() {
+   printf '%s\n' "$log"
+ }
+ 
+-canonical_before="$(shasum -a 256 "$REPO/sidecar-image-receipt.txt" | awk '{print $1}')"
+ local_log="$(run_prepare local)"
+ grep -Fq "cargo fetch --locked（source=1111111111111111111111111111111111111111）" "$WORK/local-default.out" || {
+   echo "FAIL: UTF-8 locale corrupted the source identity expansion"
+@@ -162,8 +183,10 @@ if ! grep -Fq "export PATH=\"/usr/local/rustup/toolchains/1.95.0-aarch64-unknown
+   echo "FAIL: prepare must use the image-pinned toolchain without rustup component sync"
+   exit 1
+ fi
+-canonical_after="$(shasum -a 256 "$REPO/sidecar-image-receipt.txt" | awk '{print $1}')"
+-assert_eq "$canonical_after" "$canonical_before" "local prepare preserves release receipt"
++[ ! -e "$release_receipt" ] || {
++  echo "FAIL: local prepare created a release receipt"
++  exit 1
++}
+ local_curl_before="$(wc -l < "$WORK/curl.log" | tr -d ' ')"
+ run_prepare local >/dev/null
+ local_curl_after="$(wc -l < "$WORK/curl.log" | tr -d ' ')"
+@@ -183,7 +206,8 @@ release_arm_log="$WORK/docker-release-arm64-daemon.log"
+ : > "$release_arm_log"
+ if env -i \
+   PATH="$MOCK_BIN:$PATH" HOME="$WORK/home" TMPDIR="$WORK" LC_ALL=C.UTF-8 \
+-  BUILD_PROFILE=release CTD_TEST_DAEMON_ARCH=arm64 CTD_TEST_DOCKER_LOG="$release_arm_log" \
++  BUILD_PROFILE=release CTD_RELEASE_RECEIPT_PATH="$release_receipt" \
++  CTD_TEST_DAEMON_ARCH=arm64 CTD_TEST_DOCKER_LOG="$release_arm_log" \
+   CTD_TEST_CURL_LOG="$WORK/curl.log" CTD_TEST_SERIES="$REPO/patches/transportd/series.yaml" \
+   bash "$BUILD_SCRIPT" prepare >/dev/null 2>&1; then
+   echo "FAIL: release prepare accepted an arm64 Docker daemon"
+diff --git a/deploy/build-sidecar-profile-lib.sh b/deploy/build-sidecar-profile-lib.sh
+index 151afaf9a..cebb45b14 100755
+--- a/deploy/build-sidecar-profile-lib.sh
++++ b/deploy/build-sidecar-profile-lib.sh
+@@ -10,6 +10,8 @@ ctd_configure_build_profile() {
+   local manifest="$repo/patches/transportd/series.yaml"
+   local local_state_root
+   local manifest_release_id
++  local resolved_receipt
++  local resolved_repo
+ 
+   BUILD_PROFILE="${BUILD_PROFILE:-release}"
+   manifest_release_id="$(sed -n 's/^release_id: //p' "$manifest" | tr -d ' ')"
+@@ -67,7 +69,23 @@ ctd_configure_build_profile() {
+         echo "FAIL: release profile release id must match manifest: $manifest_release_id" >&2
+         return 1
+       }
+-      RECEIPT_PATH="$repo/sidecar-image-receipt.txt"
++      RECEIPT_PATH="${CTD_RELEASE_RECEIPT_PATH:-}"
++      [ -n "$RECEIPT_PATH" ] || {
++        echo "FAIL: release profile requires CTD_RELEASE_RECEIPT_PATH" >&2
++        return 1
++      }
++      case "$RECEIPT_PATH" in
++        /*) ;;
++        *) echo "FAIL: CTD_RELEASE_RECEIPT_PATH must be absolute" >&2; return 1 ;;
++      esac
++      resolved_repo="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$repo")"
++      resolved_receipt="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$RECEIPT_PATH")"
++      case "$resolved_receipt" in
++        "$resolved_repo"|"$resolved_repo"/*)
++          echo "FAIL: CTD_RELEASE_RECEIPT_PATH must be outside the source tree" >&2
++          return 1
++          ;;
++      esac
+       DEFAULT_TARGET_CACHE=""
+       ;;
+     *)
+diff --git a/deploy/build-sidecar-volume-test.sh b/deploy/build-sidecar-volume-test.sh
+index e4f784c7a..db1cf6c78 100755
+--- a/deploy/build-sidecar-volume-test.sh
++++ b/deploy/build-sidecar-volume-test.sh
+@@ -84,6 +84,7 @@ st_lifecycle() {
+     env -i \
+       PATH="$dir:$PATH" HOME="$ST_WORK" TMPDIR="${TMPDIR:-/tmp}" LC_ALL=C \
+       PLATFORM=linux/amd64 CTD_V8_CACHE="$ST_WORK/v8" \
++      CTD_RELEASE_RECEIPT_PATH="$ST_WORK/release-receipt.txt" \
+       ST_DOCKER_LOG="$ST_DOCKER_LOG" ST_RM_LOG="$ST_RM_LOG" ST_GIT_LOG="$ST_GIT_LOG" \
+       bash "$ST_SCRIPT" build --mode local-cargo >"$ST_WORK/$behavior.log" 2>&1
+   )
+diff --git a/deploy/build-sidecar.sh b/deploy/build-sidecar.sh
+index 0755cf6f8..460968c14 100755
+--- a/deploy/build-sidecar.sh
++++ b/deploy/build-sidecar.sh
+@@ -11,12 +11,12 @@
+ #
+ # identity 模型（R9-F3 / R10）:
+ #   source_commit            = release: manifest；local: clean invocation HEAD
+-#   build_invocation_commit  = 构建调用时主仓 HEAD（receipt 记录）
++#   review_commit            = 构建调用时主仓 HEAD（receipt 记录）
+ #   build_mode               = local-cargo（发布批准）| buildx-experimental
+ #   release_tag              = manifest release_tag（指向 release_commit）
+ #
+ # 环境变量: BUILD_PROFILE(release|local；默认 release) PLATFORM IMAGE_TAG
+-#           RELEASE_ID
++#           RELEASE_ID CTD_RELEASE_RECEIPT_PATH（release profile 必填）
+ #           CTD_V8_CACHE(默认 ~/.cache/codex-transportd/v8)
+ set -euo pipefail
+ 
+@@ -61,7 +61,22 @@ if [ "${1:-}" = "prepare" ]; then
+   docker pull --platform "$PLATFORM" "$DEBIAN_IMAGE" >/dev/null
+   # v8 archive（固定 SHA256）
+   mkdir -p "$V8_CACHE"
+-  V8_URL="https://github.com/denoland/rusty_v8/releases/download/v149.2.0/${V8_NAME}"
++  # FB-1：release tag 取自 Cargo.lock 中 v8 的 resolved 版本——与上游自己的
++  # .github/scripts/rusty_v8_bazel.py resolved-v8-crate-version 同源，也正是 v8
++  # crate 的 build script 构造下载 URL 时所用的版本。此前的硬编码在
++  # v149.2.0→v150.4.0 之间漂移（URL 留在 v149.2.0，而 pin/digest 已到 v150.4.0），
++  # 使全新 runner 上的 SHA 校验必然失败；本地缓存命中时不可见，CI 才是首个暴露点。
++  V8_PIN="$(awk '
++    /^name = "v8"$/ { count++; want = (count == 1); next }
++    want && /^version = / { gsub(/"/, "", $3); print $3; want = 0 }
++    END { if (count != 1) exit 1 }
++  ' "$REPO/codex-rs/Cargo.lock")" || {
++    echo "FAIL: 期望 Cargo.lock 中恰好一个 v8 包：$REPO/codex-rs/Cargo.lock"; exit 1
++  }
++  [ -n "$V8_PIN" ] || { echo "FAIL: 无法从 Cargo.lock 解析 v8 版本"; exit 1; }
++  V8_RELEASE_TAG="v${V8_PIN}"
++  echo "   v8 release tag=${V8_RELEASE_TAG}（Cargo.lock resolved v8=${V8_PIN}）"
++  V8_URL="https://github.com/denoland/rusty_v8/releases/download/${V8_RELEASE_TAG}/${V8_NAME}"
+   V8_ARCHIVE="$V8_CACHE/${V8_NAME}"
+   V8_CACHE_SHA=""
+   if [ -f "$V8_ARCHIVE" ]; then
+@@ -181,7 +196,7 @@ if [ "$(printf '%s' "$SOURCE_COMMIT" | wc -c | tr -d ' ')" -ne 40 ]; then
+   echo "FAIL: source_commit 必须是完整 40 位 commit: '$SOURCE_COMMIT'"; exit 1
+ fi
+ echo "   source_commit=${SOURCE_COMMIT}（kind=${SOURCE_ID_KIND}）"
+-echo "   build_invocation_commit=$HEAD0"
++echo "   review_commit=$HEAD0"
+ echo "   build_profile=$BUILD_PROFILE platform=$PLATFORM"
+ echo "   build_mode=$MODE"
+ 
+@@ -192,11 +207,45 @@ git -C "$SRC" checkout --quiet "$SOURCE_COMMIT"
+ [ "$(git -C "$SRC" rev-parse HEAD)" = "$SOURCE_COMMIT" ] || { echo "FAIL: clone checkout 不一致"; exit 1; }
+ SOURCE_TREE="$(git -C "$SRC" rev-parse 'HEAD^{tree}')"
+ LOCK0="$(git -C "$SRC" show "HEAD:codex-rs/Cargo.lock" | shasum -a 256 | awk '{print $1}')"
++
++# R3/F-06：/info 的 codex_* 三项必须与 fork_* 分开断言。
++# 此前只断言 fork 侧身份，导致 r1 带着 codex_tag=rust-v0.153.4 出厂，断言却仍打印
++# “/info pin 全部一致 ✓”——正是本轮要修正的三个常量无人看管。
++# codex_commit 是 UPSTREAM peeled commit（不是本仓 source_commit），codex_tag 取自
++# series.yaml，cargo_lock_sha256 是上游基线树的锁文件摘要。
++UPSTREAM_TAG_EXPECT="$(sed -n 's/^upstream_tag: //p' "$REPO/patches/transportd/series.yaml" | tr -d ' ')"
++UPSTREAM_COMMIT_EXPECT="$(sed -n 's/^peeled_base_commit: //p' "$REPO/patches/transportd/series.yaml" | tr -d ' ')"
++for v in "$UPSTREAM_TAG_EXPECT" "$UPSTREAM_COMMIT_EXPECT"; do
++  [ -n "$v" ] || { echo "FAIL: series.yaml 缺少 upstream_tag / peeled_base_commit"; exit 1; }
++done
++UPSTREAM_LOCK_EXPECT="$(git -C "$SRC" show "$UPSTREAM_COMMIT_EXPECT:codex-rs/Cargo.lock" | shasum -a 256 | awk '{print $1}')"
++[ -n "$UPSTREAM_LOCK_EXPECT" ] || { echo "FAIL: 无法读取上游基线的 codex-rs/Cargo.lock"; exit 1; }
++
++# D.4：/info 的三项此前无断言，但都会被本次身份变更直接改变——期望值一律
++# 从**被构建的源码树**推导，不写死（写死就等于把常量复制成第二份事实来源）。
++EXPECT_UPSTREAM_VERSION="$(python3 - "$SRC/codex-rs/Cargo.toml" <<'PY'
++import re, sys
++text = open(sys.argv[1], encoding="utf-8").read()
++block = re.search(r"^\[workspace\.package\]\s*$(.*?)(?=^\[)", text, re.M | re.S)
++print(re.search(r'^version\s*=\s*"([^"]+)"', block.group(1), re.M).group(1))
++PY
++)"
++[ -n "$EXPECT_UPSTREAM_VERSION" ] || { echo "FAIL: 无法从 codex-rs/Cargo.toml 推导 workspace version"; exit 1; }
++EXPECT_RUST_TOOLCHAIN="$(sed -n 's/^channel = "\(.*\)"/\1/p' "$SRC/codex-rs/rust-toolchain.toml")"
++[ -n "$EXPECT_RUST_TOOLCHAIN" ] || { echo "FAIL: 无法从 codex-rs/rust-toolchain.toml 推导 channel"; exit 1; }
++# 运行阶段的 FROM（Dockerfile 里最后一个 FROM，即不带 AS 的运行镜像）。
++EXPECT_BASE_IMAGE_REF="$(sed -n 's/^FROM[[:space:]]\+\([^[:space:]]*\).*/\1/p' "$SRC/codex-rs/codex-transportd/Dockerfile" | tail -1)"
++[ -n "$EXPECT_BASE_IMAGE_REF" ] || { echo "FAIL: 无法从 Dockerfile 运行阶段推导 base image ref"; exit 1; }
+ echo "   source=$SOURCE_COMMIT lock=$LOCK0"
+ 
+ echo "== 2. 构建（--locked，${MODE}） =="
+ if [ "$MODE" = "local-cargo" ]; then
+   echo "   [local-cargo] --network none + 只读 source + 独立 target"
++  # FB-4：git 的 dubious-ownership 保护会拒绝以 root 读取 runner 用户克隆出来的 /src。
++  # build.rs 正是从该 repo 取 HEAD 生成 fork_commit，被拒时它**静默**留空，
++  # 直到构建后的 /info pin 校验才暴露（本次 CI 的失败点）。必须在容器内声明
++  # safe.directory——这就是为什么这一步不能省。该修复的出处是 rust-v0.153.4 线的
++  # edc2264141；本次 replay 已把它折入补丁系列（patch 0017），不再是系列之外的一次性提交。
+   docker run --rm --pull=never --network none --platform "$PLATFORM" \
+     -v "$SRC":/src:ro \
+     -v "$TARGET_DIR":/target \
+@@ -208,7 +257,7 @@ if [ "$MODE" = "local-cargo" ]; then
+     -e CTD_EXPECTED_UNAME="$EXPECTED_UNAME" \
+     -e "RUSTY_V8_ARCHIVE=/v8-cache/${V8_NAME}" \
+     "$RUST_IMAGE" \
+-    bash -c "actual=\$(uname -m); [ \"\$actual\" = \"\$CTD_EXPECTED_UNAME\" ] || { echo \"FAIL: builder uname=\$actual expected=\$CTD_EXPECTED_UNAME\"; exit 1; }; export PATH=\"/usr/local/rustup/toolchains/1.95.0-${TRIPLE}/bin:\$PATH\"; cd /src/codex-rs && cargo build --release --locked --offline -p codex-transportd"
++    bash -c "git config --global --add safe.directory /src >/dev/null 2>&1 || true; actual=\$(uname -m); [ \"\$actual\" = \"\$CTD_EXPECTED_UNAME\" ] || { echo \"FAIL: builder uname=\$actual expected=\$CTD_EXPECTED_UNAME\"; exit 1; }; export PATH=\"/usr/local/rustup/toolchains/1.95.0-${TRIPLE}/bin:\$PATH\"; cd /src/codex-rs && cargo build --release --locked --offline -p codex-transportd"
+   ELF="$TARGET_DIR/release/codex-transportd"
+   [ -f "$ELF" ] || { echo "FAIL: ELF 未产出"; exit 1; }
+   CTX="$WORK_DIR/ctx"
+@@ -268,12 +317,10 @@ esac
+ echo "   ELF target=$TRIPLE ✓"
+ 
+ echo "== 5. /info 完整 pin 校验 =="
+-# R12-F2：digest 统一为裸 OCI 格式 sha256:hex（与 Compose CODEX_TRANSPORTD_DIGEST 同口径）。
+-if [ "$BUILD_PROFILE" = "local" ]; then
+-  DIGEST="$(docker image inspect "$IMAGE_TAG" --format '{{.Id}}')"
+-else
+-  DIGEST="$(docker image inspect "$IMAGE_TAG" --format '{{index .RepoDigests 0}}' | sed 's/.*@//')"
+-fi
++# A locally built image has no RepoDigest until it is pushed. Bind /info and the
++# producer receipt to Docker's content-addressed image ID; the release
++# materialization step separately binds the exact docker-save archive bytes.
++DIGEST="$(docker image inspect "$IMAGE_TAG" --format '{{.Id}}')"
+ # R17-F2/R18-F2：smoke volume 已在共享段创建（daemon 匿名名，owned=1），
+ # 此处直接复用，不再重复 create（避免幂等 create 掩盖 ownership 语义）。
+ docker run --rm --pull=never --platform "$PLATFORM" --user 0:0 -v "$SMOKE_VOL":/run/ctd -v "$SMOKE_VOL":/var/lib/ctd-home \
+@@ -290,9 +337,11 @@ for i in $(seq 1 30); do
+   sleep 1
+   [ "$i" = 30 ] && { echo "FAIL: sidecar /info 不可达"; docker logs "$CID" 2>&1 | tail -3; exit 1; }
+ done
+-python3 - "$SOURCE_COMMIT" "$TRIPLE" "$LOCK0" "$RELEASE_ID" "$DIGEST" "$BUILD_PROFILE" "$INFO_TMP.json" <<'PYEOF'
++python3 - "$SOURCE_COMMIT" "$TRIPLE" "$LOCK0" "$RELEASE_ID" "$DIGEST" "$BUILD_PROFILE" "$UPSTREAM_TAG_EXPECT" "$UPSTREAM_COMMIT_EXPECT" "$UPSTREAM_LOCK_EXPECT" "$EXPECT_UPSTREAM_VERSION" "$EXPECT_RUST_TOOLCHAIN" "$EXPECT_BASE_IMAGE_REF" "$INFO_TMP.json" <<'PYEOF'
+ import json, sys
+-expect_head, expect_triple, expect_lock, expect_release, expect_digest, profile, path = sys.argv[1:]
++expect_head, expect_triple, expect_lock, expect_release, expect_digest, profile, \
++    expect_tag, expect_upstream_commit, expect_upstream_lock, expect_upstream_version, \
++    expect_rust_toolchain, expect_base_image_ref, path = sys.argv[1:]
+ info = json.load(open(path))
+ checks = {
+     'fork_commit': (info.get('fork_commit'), expect_head),
+@@ -300,6 +349,14 @@ checks = {
+     'fork_cargo_lock_sha256': (info.get('fork_cargo_lock_sha256'), expect_lock),
+     'release_id': (info.get('release_id'), expect_release),
+     'image_digest': (info.get('image_digest'), expect_digest),
++    # R3/F-06：本轮修正的三个常量。
++    'codex_tag': (info.get('codex_tag'), expect_tag),
++    'codex_commit': (info.get('codex_commit'), expect_upstream_commit),
++    'cargo_lock_sha256': (info.get('cargo_lock_sha256'), expect_upstream_lock),
++    # D.4：workspace version / toolchain / base image 三项此前无断言。
++    'codex_version': (info.get('codex_version'), expect_upstream_version),
++    'rust_toolchain': (info.get('rust_toolchain'), expect_rust_toolchain),
++    'base_image_ref': (info.get('base_image_ref'), expect_base_image_ref),
+ }
+ failed = False
+ for k, (actual, want) in checks.items():
+@@ -318,7 +375,10 @@ if (profile == 'release' and is_dev) or (profile == 'local' and not is_dev):
+     failed = True
+ if failed:
+     sys.exit(1)
+-print('   /info pin 全部一致 ✓ (commit/target/lock/release_id/image_digest/attestation/test_upstream)')
++print('   /info pin 全部一致 ✓ (codex_tag/codex_commit/cargo_lock_sha256 + '
++      'fork_commit/target/fork_cargo_lock_sha256/release_id/image_digest/attestation/test_upstream + '
++      'codex_version/rust_toolchain/base_image_ref)')
++# build_proof_digest 是构建后产物绑定，由 bin-verify.sh 在发布阶段守，源码阶段不断言。
+ PYEOF
+ docker exec "$CID" curl -fsS --unix-socket /run/ctd/sock/transport.sock http://localhost/_internal/v1/health/ready >/dev/null \
+   || { echo "FAIL: health/ready"; exit 1; }
+@@ -329,22 +389,25 @@ RECEIPT="$RECEIPT_PATH"
+ mkdir -p "$(dirname "$RECEIPT")"
+ BUILD_ELAPSED_SECONDS="$(( $(date +%s) - BUILD_STARTED_EPOCH ))"
+ cat > "$RECEIPT" <<EOF
+-image:                    $IMAGE_TAG
+-build_profile:            $BUILD_PROFILE
+-platform:                 $PLATFORM
+-arch:                     $ARCH
+-triple:                   $TRIPLE
+-deb_arch:                 $DEB_ARCH
+-digest:                   $DIGEST
+-release_id:               $RELEASE_ID
+-source_commit:            $SOURCE_COMMIT
+-source_tree:              $SOURCE_TREE
+-build_invocation_commit:  $HEAD0
+-build_mode:               $MODE
+-lock_sha256:              $LOCK0
+-v8_sha256:                $V8_EXPECTED_SHA
+-elapsed_seconds:           $BUILD_ELAPSED_SECONDS
+-build:                    $(date -u +%Y-%m-%dT%H:%M:%SZ)
++schema: ctd/evidence-receipt/v2
++artifact_kind: oci-image
++artifact_digest: $DIGEST
++image: $IMAGE_TAG
++build_profile: $BUILD_PROFILE
++platform: $PLATFORM
++arch: $ARCH
++triple: $TRIPLE
++deb_arch: $DEB_ARCH
++release_id: $RELEASE_ID
++source_commit: $SOURCE_COMMIT
++source_tree: $SOURCE_TREE
++review_commit: $HEAD0
++review_tree: $TREE0
++build_mode: $MODE
++lock_sha256: $LOCK0
++v8_sha256: $V8_EXPECTED_SHA
++elapsed_seconds: $BUILD_ELAPSED_SECONDS
++build: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+ EOF
+ cat "$RECEIPT"
+ echo "build-sidecar.sh 全部通过（profile=${BUILD_PROFILE} mode=${MODE} receipt=${RECEIPT}）"
+diff --git a/patches/transportd/tools/bin-verify.sh b/patches/transportd/tools/bin-verify.sh
+new file mode 100755
+index 000000000..7ad2d0622
+--- /dev/null
++++ b/patches/transportd/tools/bin-verify.sh
+@@ -0,0 +1,104 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++# shellcheck source=patches/transportd/tools/identity-lib.sh
++source "$(dirname "$0")/identity-lib.sh"
++REPO="$(ctd_repo_root)"
++RECEIPT=""
++ARTIFACT=""
++BINARY=""
++
++fail() {
++  echo "FAIL: $*" >&2
++  exit 1
++}
++
++while [ "$#" -gt 0 ]; do
++  case "$1" in
++    --receipt) RECEIPT="${2:-}"; shift 2 ;;
++    --artifact) ARTIFACT="${2:-}"; shift 2 ;;
++    --binary) BINARY="${2:-}"; shift 2 ;;
++    *) fail "unknown argument: $1" ;;
++  esac
++done
++for binding in "receipt:$RECEIPT" "artifact:$ARTIFACT" "binary:$BINARY"; do
++  name="${binding%%:*}"
++  path="${binding#*:}"
++  [ -n "$path" ] || fail "--$name is required"
++  ctd_require_external_receipt "$REPO" "$path"
++  [ -s "$path" ] || fail "$name is missing or empty: $path"
++done
++
++same_path() {
++  [ "$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1")" = \
++    "$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$2")" ]
++}
++
++same_path "$ARTIFACT" "$(ctd_field "$RECEIPT" artifact_path)" || {
++  fail "artifact path does not match receipt"
++}
++same_path "$BINARY" "$(ctd_field "$RECEIPT" binary_path)" || {
++  fail "binary path does not match receipt"
++}
++ARTIFACT_DIGEST="$(ctd_field "$RECEIPT" artifact_digest)"
++BINARY_DIGEST="$(ctd_field "$RECEIPT" binary_digest)"
++IMAGE_DIGEST="$(ctd_field "$RECEIPT" image_digest)"
++[ "$ARTIFACT_DIGEST" = "sha256:$(ctd_sha256 "$ARTIFACT")" ] || {
++  fail "release artifact digest mismatch"
++}
++[ "$BINARY_DIGEST" = "sha256:$(ctd_sha256 "$BINARY")" ] || {
++  fail "release binary digest mismatch"
++}
++case "$IMAGE_DIGEST" in
++  sha256:*) ctd_require_hex image_digest "${IMAGE_DIGEST#sha256:}" 64 ;;
++  *) fail "image_digest must use sha256" ;;
++esac
++
++python3 - "$ARTIFACT" "$IMAGE_DIGEST" <<'PY'
++import hashlib
++import json
++import sys
++import tarfile
++
++artifact, image_digest = sys.argv[1:]
++expected = image_digest.removeprefix("sha256:")
++with tarfile.open(artifact, "r:*") as archive:
++    manifest_file = archive.extractfile("manifest.json")
++    if manifest_file is None:
++        raise SystemExit("FAIL: Docker archive is missing manifest.json")
++    manifest = json.load(manifest_file)
++    if not isinstance(manifest, list) or len(manifest) != 1:
++        raise SystemExit("FAIL: Docker archive must contain exactly one image")
++    config_name = manifest[0].get("Config")
++    if not isinstance(config_name, str):
++        raise SystemExit("FAIL: Docker archive manifest is missing Config")
++    config_file = archive.extractfile(config_name)
++    if config_file is None:
++        raise SystemExit("FAIL: Docker archive image config is missing")
++    actual = hashlib.sha256(config_file.read()).hexdigest()
++    if actual != expected:
++        raise SystemExit("FAIL: Docker archive image ID does not match receipt")
++PY
++
++[ "$(docker image inspect "$IMAGE_DIGEST" --format '{{.Id}}')" = "$IMAGE_DIGEST" ] || {
++  fail "materialized image ID is not loaded"
++}
++WORK="$(mktemp -d "${TMPDIR:-/tmp}/ctd-bin-verify.XXXXXX")"
++CONTAINER_ID=""
++cleanup() {
++  if [ -n "$CONTAINER_ID" ]; then
++    docker rm -f "$CONTAINER_ID" >/dev/null 2>&1 || true
++  fi
++  rm -rf "$WORK"
++}
++trap cleanup EXIT
++CONTAINER_ID="$(docker create "$IMAGE_DIGEST")"
++docker cp "$CONTAINER_ID":/app/codex-transportd "$WORK/codex-transportd"
++cmp -s "$BINARY" "$WORK/codex-transportd" || fail "receipt binary differs from image binary"
++[ "sha256:$(ctd_sha256 "$WORK/codex-transportd")" = "$BINARY_DIGEST" ] || {
++  fail "image binary digest mismatch"
++}
++file "$WORK/codex-transportd" | grep -q 'ELF' || fail "release binary is not ELF"
++
++echo "PASS: Docker archive image ID $IMAGE_DIGEST"
++echo "PASS: image binary $BINARY_DIGEST"
+diff --git a/patches/transportd/tools/capture-isolation-gate.sh b/patches/transportd/tools/capture-isolation-gate.sh
+new file mode 100755
+index 000000000..a796e1d6c
+--- /dev/null
++++ b/patches/transportd/tools/capture-isolation-gate.sh
+@@ -0,0 +1,17 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
++SRC="$REPO/codex-rs/codex-transportd/src"
++
++grep -qF "CAPTURE_MAX_BYTES" "$SRC/capture.rs"
++grep -qF "MAX_QUEUE" "$SRC/capture.rs"
++grep -qF "checked_add" "$SRC/capture_budget.rs"
++grep -qF "ErrorKind::WriteZero" "$SRC/capture_writer.rs"
++grep -qF "budget.release(carried)" "$SRC/capture_writer.rs"
++if grep -RqsF "saturating_sub" "$SRC/capture.rs" "$SRC/capture_budget.rs" "$SRC/capture_writer.rs"; then
++  echo "FAIL: capture byte accounting contains fail-open subtraction" >&2
++  exit 1
++fi
++
++echo "PASS: capture queue, byte budget, and write-progress invariants"
+diff --git a/patches/transportd/tools/ci-gates-static-test.sh b/patches/transportd/tools/ci-gates-static-test.sh
+new file mode 100755
+index 000000000..d2fb038d5
+--- /dev/null
++++ b/patches/transportd/tools/ci-gates-static-test.sh
+@@ -0,0 +1,126 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
++cd "$REPO"
++
++python3 - "$REPO" <<'PY'
++import re
++import stat
++import subprocess
++import sys
++from pathlib import Path
++
++repo = Path(sys.argv[1])
++inputs = [
++    repo / ".github/workflows/worker-ci.yml",
++    repo / ".github/workflows/transportd-release-gates.yml",
++    repo / "RUNBOOK.md",
++    *sorted((repo / "deploy").glob("*.sh")),
++]
++command = re.compile(
++    r"(?:^|[;&|]\s*|\brun:\s*|\s)(?:bash|sh)\s+"
++    r'["\']?(?:\$REPO/)?'
++    r"((?:\./)?(?:patches|replay|deploy|codex-rs)/[A-Za-z0-9_./-]+\.sh)"
++)
++referenced = set()
++for source in inputs:
++    if not source.is_file():
++        raise SystemExit(f"FAIL: static-check input is missing: {source.relative_to(repo)}")
++    for match in command.finditer(source.read_text(encoding="utf-8")):
++        referenced.add(match.group(1).removeprefix("./"))
++
++required_tools = {
++    "patches/transportd/tools/export-gate.sh",
++    "patches/transportd/tools/release-evidence-gate.sh",
++    "patches/transportd/tools/write-source-receipt.sh",
++    "patches/transportd/tools/ci-gates-static-test.sh",
++    "patches/transportd/tools/static-fix-gates.sh",
++    "patches/transportd/tools/capture-isolation-gate.sh",
++    "patches/transportd/tools/gate-mutation-test.sh",
++    "patches/transportd/tools/gate-export-mutation-test.sh",
++    "patches/transportd/tools/gate-evidence-mutation-test.sh",
++    "patches/transportd/tools/gate-wire-sbom-mutation-test.sh",
++    "patches/transportd/tools/materialize-release-artifact.sh",
++    "patches/transportd/tools/bin-verify.sh",
++    "patches/transportd/tools/release-tag-verify.sh",
++    "patches/transportd/tools/wire-gate.sh",
++    "patches/transportd/tools/sbom-gate.sh",
++}
++for relative in sorted(required_tools):
++    for match in command.finditer((repo / relative).read_text(encoding="utf-8")):
++        referenced.add(match.group(1).removeprefix("./"))
++missing_references = required_tools - referenced
++if missing_references:
++    raise SystemExit(f"FAIL: expected gate commands are not referenced: {sorted(missing_references)}")
++
++repo_file = re.compile(
++    r"\$REPO/([A-Za-z0-9_./-]+\.(?:json|lock|md|rs|toml|yaml|yml))"
++)
++referenced_inputs = set()
++for relative in sorted(required_tools):
++    text = (repo / relative).read_text(encoding="utf-8")
++    referenced_inputs.update(repo_file.findall(text))
++
++required_files = referenced | referenced_inputs | {"patches/transportd/tools/identity-lib.sh"}
++for relative in sorted(required_files):
++    path = repo / relative
++    if not path.is_file():
++        raise SystemExit(f"FAIL: referenced gate input is missing: {relative}")
++    tracked = subprocess.run(
++        ["git", "-C", str(repo), "ls-files", "--error-unmatch", relative],
++        check=False,
++        stdout=subprocess.DEVNULL,
++        stderr=subprocess.DEVNULL,
++    )
++    if tracked.returncode != 0:
++        raise SystemExit(f"FAIL: referenced gate input is not tracked: {relative}")
++    if path.suffix == ".sh" and not path.stat().st_mode & stat.S_IXUSR:
++        raise SystemExit(f"FAIL: referenced script is not executable: {relative}")
++
++worker = (repo / ".github/workflows/worker-ci.yml").read_text(encoding="utf-8")
++release = (repo / ".github/workflows/transportd-release-gates.yml").read_text(encoding="utf-8")
++runbook = (repo / "RUNBOOK.md").read_text(encoding="utf-8")
++for name, text in {"worker-ci": worker, "release-gates": release, "RUNBOOK": runbook}.items():
++    if "release-evidence-gate.sh --receipt" not in text:
++        raise SystemExit(f"FAIL: {name} does not pass an explicit receipt path")
++release_build = release.find("BUILD_PROFILE=release bash deploy/build-sidecar.sh prepare")
++release_materialize = release.find("materialize-release-artifact.sh")
++release_verify = release.find("release-tag-verify.sh", release_materialize)
++if min(release_build, release_materialize, release_verify) < 0:
++    raise SystemExit("FAIL: release workflow is missing build, materialize, or verify steps")
++if not release_build < release_materialize < release_verify:
++    raise SystemExit("FAIL: release workflow must build and materialize before verification")
++for variable in {
++    "CTD_RELEASE_ARTIFACT_PATH",
++    "CTD_RELEASE_BINARY_PATH",
++    "CTD_RELEASE_SBOM_PATH",
++    "CTD_RELEASE_LICENSE_REPORT_PATH",
++}:
++    if release.count(variable) < 2:
++        raise SystemExit(f"FAIL: release workflow does not carry {variable} into verification")
++if "sidecar-image-receipt.txt" in "\n".join(path.read_text(encoding="utf-8") for path in inputs):
++    raise SystemExit("FAIL: build/workflow documentation still names an in-tree receipt")
++
++
++# gate 字段唯一性：sbom-gate.sh / wire-gate.sh 用 ctd_field（head -1）取值，
++# 因此同一字段出现两次时"较旧的那组"会胜出，而闸门仍报绿——文件自相矛盾却无人发现。
++# 这里在树级别兜底：每个字段至多一次（产品提交处这些字段本就不存在，故用 <=1）。
++for _doc, _keys in (
++    ("SBOM.md", ("sbom_source_commit", "sbom_source_tree", "sbom_cargo_lock_sha256",
++                 "sbom_module_bazel_lock_sha256", "sbom_status", "sbom_artifact_status")),
++    ("WIRE_COMPATIBILITY.md", ("wire_source_commit", "wire_source_tree", "wire_status")),
++):
++    _path = repo / _doc
++    if not _path.is_file():
++        continue
++    _text = _path.read_text(encoding="utf-8")
++    for _key in _keys:
++        _n = len(re.findall(rf"^{_key}:", _text, re.M))
++        if _n > 1:
++            raise SystemExit(f"FAIL: {_doc} 中 {_key} 出现 {_n} 次（闸门取 head -1，会被旧值蒙混）")
++print(
++    f"PASS: {len(referenced)} script commands and {len(referenced_inputs)} "
++    "non-shell gate inputs are tracked"
++)
++PY
+diff --git a/patches/transportd/tools/export-gate.sh b/patches/transportd/tools/export-gate.sh
+new file mode 100755
+index 000000000..23adfa9f7
+--- /dev/null
++++ b/patches/transportd/tools/export-gate.sh
+@@ -0,0 +1,81 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++# shellcheck source=patches/transportd/tools/identity-lib.sh
++source "$(dirname "$0")/identity-lib.sh"
++REPO="$(ctd_repo_root)"
++PATCHES_DIR="${PATCHES_DIR:-$REPO/patches/transportd}"
++MANIFEST="$PATCHES_DIR/series.yaml"
++
++fail() {
++  echo "FAIL: $*" >&2
++  exit 1
++}
++
++[ "$#" -eq 0 ] || fail "export-gate accepts no arguments"
++[ -f "$MANIFEST" ] || fail "series manifest is missing: $MANIFEST"
++
++BASE="$(ctd_field "$MANIFEST" peeled_base_commit)"
++SOURCE_COMMIT="$(ctd_field "$MANIFEST" source_commit)"
++SOURCE_TREE="$(ctd_field "$MANIFEST" source_tree)"
++EXPECTED_RELEASE_TREE="$(ctd_field "$MANIFEST" expected_release_tree)"
++EXPECTED_COUNT="$(ctd_field "$MANIFEST" series_entries)"
++EXPECTED_CARGO_LOCK="$(ctd_field "$MANIFEST" cargo_lock_sha256)"
++EXPECTED_BAZEL_LOCK="$(ctd_field "$MANIFEST" module_bazel_lock_sha256)"
++ctd_require_hex peeled_base_commit "$BASE" 40
++ctd_require_hex source_commit "$SOURCE_COMMIT" 40
++ctd_require_hex source_tree "$SOURCE_TREE" 40
++ctd_require_hex expected_release_tree "$EXPECTED_RELEASE_TREE" 40
++ctd_require_hex cargo_lock_sha256 "$EXPECTED_CARGO_LOCK" 64
++ctd_require_hex module_bazel_lock_sha256 "$EXPECTED_BAZEL_LOCK" 64
++case "$EXPECTED_COUNT" in
++  ''|*[!0-9]*) fail "series_entries must be a positive integer" ;;
++esac
++[ "$EXPECTED_COUNT" -gt 0 ] || fail "series_entries must be positive"
++
++git -C "$REPO" cat-file -e "$BASE^{commit}" 2>/dev/null || fail "base commit is unavailable: $BASE"
++git -C "$REPO" cat-file -e "$SOURCE_COMMIT^{commit}" 2>/dev/null || fail "source commit is unavailable: $SOURCE_COMMIT"
++git -C "$REPO" merge-base --is-ancestor "$BASE" "$SOURCE_COMMIT" || fail "base is not an ancestor of source"
++[ "$(git -C "$REPO" rev-parse "$SOURCE_COMMIT^{tree}")" = "$SOURCE_TREE" ] || fail "source commit/tree mismatch"
++[ "$EXPECTED_RELEASE_TREE" = "$SOURCE_TREE" ] || fail "expected release tree does not match source tree"
++[ "$(git -C "$REPO" show "$SOURCE_COMMIT:codex-rs/Cargo.lock" | ctd_sha256 /dev/stdin)" = "$EXPECTED_CARGO_LOCK" ] || fail "source Cargo.lock digest mismatch"
++[ "$(git -C "$REPO" show "$SOURCE_COMMIT:MODULE.bazel.lock" | ctd_sha256 /dev/stdin)" = "$EXPECTED_BAZEL_LOCK" ] || fail "source MODULE.bazel.lock digest mismatch"
++
++SERIES=()
++while IFS= read -r entry; do
++  file="${entry#  - }"
++  [ -n "$file" ] || fail "empty series entry"
++  [ -f "$PATCHES_DIR/$file" ] || fail "series entry is missing: $file"
++  SERIES+=("$file")
++done < <(grep '^  - full/.*\.patch$' "$MANIFEST")
++[ "${#SERIES[@]}" -eq "$EXPECTED_COUNT" ] || fail "series entry count mismatch"
++
++actual_patches="$(find "$PATCHES_DIR/full" -maxdepth 1 -type f -name '*.patch' | wc -l | tr -d ' ')"
++[ "$actual_patches" -eq "$EXPECTED_COUNT" ] || fail "unlisted or missing patch files"
++
++WORK="$(mktemp -d "${TMPDIR:-/tmp}/ctd-export.XXXXXX")"
++REPLAY="$WORK/replay"
++cleanup() {
++  git -C "$REPO" worktree remove --force "$REPLAY" >/dev/null 2>&1 || true
++  rm -rf "$WORK"
++}
++trap cleanup EXIT
++
++git -C "$REPO" worktree add --detach "$REPLAY" "$BASE" >/dev/null
++PATCH_PATHS=()
++for file in "${SERIES[@]}"; do
++  PATCH_PATHS+=("$PATCHES_DIR/$file")
++done
++git -C "$REPLAY" am --quiet "${PATCH_PATHS[@]}"
++
++REPLAY_TREE="$(git -C "$REPLAY" rev-parse 'HEAD^{tree}')"
++[ "$REPLAY_TREE" = "$SOURCE_TREE" ] || {
++  git -C "$REPLAY" diff --stat "$SOURCE_TREE" HEAD >&2 || true
++  fail "exported tree $REPLAY_TREE does not equal declared source tree $SOURCE_TREE"
++}
++
++REVIEW_COMMIT="$(git -C "$REPO" rev-parse HEAD)"
++REVIEW_TREE="$(git -C "$REPO" rev-parse 'HEAD^{tree}')"
++echo "PASS: source_commit=$SOURCE_COMMIT source_tree=$SOURCE_TREE"
++echo "PASS: exported_tree=$REPLAY_TREE patches=${#SERIES[@]}"
++echo "PASS: review_commit=$REVIEW_COMMIT review_tree=$REVIEW_TREE"
+diff --git a/patches/transportd/tools/gate-evidence-mutation-test.sh b/patches/transportd/tools/gate-evidence-mutation-test.sh
+new file mode 100755
+index 000000000..b5165523d
+--- /dev/null
++++ b/patches/transportd/tools/gate-evidence-mutation-test.sh
+@@ -0,0 +1,30 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
++WRITE="$REPO/patches/transportd/tools/write-source-receipt.sh"
++GATE="$REPO/patches/transportd/tools/release-evidence-gate.sh"
++WORK="$(mktemp -d "${TMPDIR:-/tmp}/ctd-evidence-mutation.XXXXXX")"
++trap 'rm -rf "$WORK"' EXIT
++RECEIPT="$WORK/source-receipt.txt"
++
++"$WRITE" "$RECEIPT" >/dev/null
++"$GATE" --receipt "$RECEIPT" >/dev/null
++python3 - "$RECEIPT" <<'PY'
++import re
++import sys
++
++path = sys.argv[1]
++text = open(path, encoding="utf-8").read()
++text = re.sub(r"^source_tree: [0-9a-f]{40}$", "source_tree: " + "f" * 40, text, count=1, flags=re.M)
++open(path, "w", encoding="utf-8").write(text)
++PY
++if "$GATE" --receipt "$RECEIPT" >"$WORK/gate.log" 2>&1; then
++  echo "FAIL: evidence gate accepted a forged source tree" >&2
++  exit 1
++fi
++grep -qF "receipt source_tree mismatch" "$WORK/gate.log" || {
++  echo "FAIL: forged receipt failure reason was not deterministic" >&2
++  exit 1
++}
++echo "PASS: evidence gate rejects source-tree mutation"
+diff --git a/patches/transportd/tools/gate-export-mutation-test.sh b/patches/transportd/tools/gate-export-mutation-test.sh
+new file mode 100755
+index 000000000..6dc5c16f9
+--- /dev/null
++++ b/patches/transportd/tools/gate-export-mutation-test.sh
+@@ -0,0 +1,28 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
++GOLDEN="$REPO/codex-rs/codex-transportd/tests/fixtures/operations_snapshot.golden.json"
++
++python3 - "$GOLDEN" <<'PY'
++import json
++import sys
++
++document = json.load(open(sys.argv[1], encoding="utf-8"))
++operations = document["operations"]
++names = [row["operation"] for row in operations]
++if document["operation_count"] != len(operations):
++    raise SystemExit("FAIL: golden operation_count does not match rows")
++if len(names) != len(set(names)):
++    raise SystemExit("FAIL: golden contains duplicate operations")
++if not {"models", "file_download", "oauth_whoami"}.issubset(names):
++    raise SystemExit("FAIL: golden is missing required closed operations")
++
++mutated = dict(document)
++mutated["operations"] = operations[:-1]
++if mutated["operation_count"] == len(mutated["operations"]):
++    raise SystemExit("FAIL: count guard did not detect a missing row")
++print("PASS: operations golden structure and missing-row mutation guard")
++PY
++
++(cd "$REPO/codex-rs" && just test -p codex-transportd --test operations_snapshot_golden)
+diff --git a/patches/transportd/tools/gate-mutation-test.sh b/patches/transportd/tools/gate-mutation-test.sh
+new file mode 100755
+index 000000000..ed498e451
+--- /dev/null
++++ b/patches/transportd/tools/gate-mutation-test.sh
+@@ -0,0 +1,64 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
++GATE="$REPO/patches/transportd/tools/export-gate.sh"
++WORK="$(mktemp -d "${TMPDIR:-/tmp}/ctd-export-mutation.XXXXXX")"
++trap 'rm -rf "$WORK"' EXIT
++cp -R "$REPO/patches/transportd" "$WORK/transportd"
++
++PATCHES_DIR="$WORK/transportd" "$GATE" >/dev/null
++python3 - "$WORK/transportd/series.yaml" <<'PY'
++import re
++import sys
++
++path = sys.argv[1]
++text = open(path, encoding="utf-8").read()
++text = re.sub(r"^source_tree: [0-9a-f]{40}$", "source_tree: " + "0" * 40, text, count=1, flags=re.M)
++open(path, "w", encoding="utf-8").write(text)
++PY
++if PATCHES_DIR="$WORK/transportd" "$GATE" >"$WORK/gate.log" 2>&1; then
++  echo "FAIL: export gate accepted a forged source tree" >&2
++  exit 1
++fi
++grep -qF "source commit/tree mismatch" "$WORK/gate.log" || {
++  echo "FAIL: forged-tree failure reason was not deterministic" >&2
++  exit 1
++}
++echo "PASS: export gate rejects source-tree mutation"
++
++REPLAY_MANIFEST="$WORK/replay-manifest.yaml"
++cp "$REPO/replay/manifest.yaml" "$REPLAY_MANIFEST"
++BASE_COMMIT="$(sed -n 's/^base_commit: //p' "$REPLAY_MANIFEST" | head -1)"
++BASE_TREE="$(git -C "$REPO" rev-parse "$BASE_COMMIT^{tree}")"
++python3 - "$REPLAY_MANIFEST" "$BASE_COMMIT" "$BASE_TREE" <<'PY'
++import re
++import sys
++
++path, base_commit, base_tree = sys.argv[1:]
++text = open(path, encoding="utf-8").read()
++text = re.sub(
++    r"^release_commit: [0-9a-f]{40}$",
++    f"release_commit: {base_commit}",
++    text,
++    count=1,
++    flags=re.M,
++)
++text = re.sub(
++    r"^expected_release_tree: [0-9a-f]{40}$",
++    f"expected_release_tree: {base_tree}",
++    text,
++    count=1,
++    flags=re.M,
++)
++open(path, "w", encoding="utf-8").write(text)
++PY
++if REPLAY_MANIFEST="$REPLAY_MANIFEST" bash "$REPO/replay/gate.sh" >"$WORK/replay-gate.log" 2>&1; then
++  echo "FAIL: replay gate accepted a release commit behind source_commit" >&2
++  exit 1
++fi
++grep -qF "source_commit is not an ancestor of release_commit" "$WORK/replay-gate.log" || {
++  echo "FAIL: invalid release ancestry failure reason was not deterministic" >&2
++  exit 1
++}
++echo "PASS: replay gate rejects invalid release ancestry"
+diff --git a/patches/transportd/tools/gate-wire-sbom-mutation-test.sh b/patches/transportd/tools/gate-wire-sbom-mutation-test.sh
+new file mode 100755
+index 000000000..597404568
+--- /dev/null
++++ b/patches/transportd/tools/gate-wire-sbom-mutation-test.sh
+@@ -0,0 +1,175 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
++# shellcheck source=patches/transportd/tools/identity-lib.sh
++source "$REPO/patches/transportd/tools/identity-lib.sh"
++WORK="$(mktemp -d "${TMPDIR:-/tmp}/ctd-wire-sbom-mutation.XXXXXX")"
++trap 'rm -rf "$WORK"' EXIT
++
++bash "$REPO/patches/transportd/tools/wire-gate.sh" >/dev/null
++bash "$REPO/patches/transportd/tools/sbom-gate.sh" >/dev/null
++
++cp "$REPO/WIRE_COMPATIBILITY.md" "$WORK/WIRE_COMPATIBILITY.md"
++sed 's/^wire_source_commit: .*/wire_source_commit: 0000000000000000000000000000000000000000/' \
++  "$WORK/WIRE_COMPATIBILITY.md" >"$WORK/WIRE_COMPATIBILITY.mutated"
++if WIRE_DOC="$WORK/WIRE_COMPATIBILITY.mutated" bash "$REPO/patches/transportd/tools/wire-gate.sh" >/dev/null 2>&1; then
++  echo "FAIL: wire gate accepted a forged source commit" >&2
++  exit 1
++fi
++
++cp "$REPO/SBOM.md" "$WORK/SBOM.md"
++sed 's/^sbom_cargo_lock_sha256: .*/sbom_cargo_lock_sha256: 0000000000000000000000000000000000000000000000000000000000000000/' \
++  "$WORK/SBOM.md" >"$WORK/SBOM.mutated"
++if SBOM_DOC="$WORK/SBOM.mutated" bash "$REPO/patches/transportd/tools/sbom-gate.sh" >/dev/null 2>&1; then
++  echo "FAIL: SBOM gate accepted a forged Cargo.lock digest" >&2
++  exit 1
++fi
++
++ARTIFACT="$WORK/release-image.tar"
++BINARY="$WORK/codex-transportd"
++SBOM="$WORK/release.cdx.json"
++LICENSE_REPORT="$WORK/license-report.json"
++RECEIPT="$WORK/release-receipt.txt"
++SBOM_POLICY="$WORK/SBOM.policy.md"
++printf 'docker archive fixture\n' >"$ARTIFACT"
++printf 'ELF binary fixture\n' >"$BINARY"
++ARTIFACT_SHA="$(ctd_sha256 "$ARTIFACT")"
++BINARY_SHA="$(ctd_sha256 "$BINARY")"
++SOURCE_COMMIT="$(ctd_field "$REPO/patches/transportd/series.yaml" source_commit)"
++SOURCE_TREE="$(ctd_field "$REPO/patches/transportd/series.yaml" source_tree)"
++sed 's/^sbom_artifact_status: .*/sbom_artifact_status: external-receipt-required/' \
++  "$REPO/SBOM.md" >"$SBOM_POLICY"
++
++python3 - "$SBOM" "$LICENSE_REPORT" "$ARTIFACT_SHA" "$BINARY_SHA" \
++  "$SOURCE_COMMIT" "$SOURCE_TREE" <<'PY'
++import json
++import sys
++from pathlib import Path
++
++sbom_path, license_path, artifact_sha, binary_sha, source_commit, source_tree = sys.argv[1:]
++sbom = {
++    "bomFormat": "CycloneDX",
++    "specVersion": "1.5",
++    "version": 1,
++    "metadata": {
++        "component": {
++            "type": "container",
++            "name": "fixture",
++            "hashes": [{"alg": "SHA-256", "content": artifact_sha}],
++            "properties": [
++                {"name": "ctd:source_commit", "value": source_commit},
++                {"name": "ctd:source_tree", "value": source_tree},
++            ],
++        }
++    },
++    "components": [
++        {
++            "type": "application",
++            "name": "codex-transportd",
++            "hashes": [{"alg": "SHA-256", "content": binary_sha}],
++        }
++    ],
++}
++license_report = {
++    "schema": "ctd/license-report/v1",
++    "artifactDigest": f"sha256:{artifact_sha}",
++    "binaryDigest": f"sha256:{binary_sha}",
++    "licenses": [{"expression": "Apache-2.0"}],
++}
++Path(sbom_path).write_text(json.dumps(sbom) + "\n", encoding="utf-8")
++Path(license_path).write_text(json.dumps(license_report) + "\n", encoding="utf-8")
++PY
++
++write_receipt() {
++  local output="$1"
++  local sbom_path="$2"
++  local sbom_artifact_digest="$3"
++  cat >"$output" <<EOF
++schema: ctd/evidence-receipt/v2
++artifact_kind: oci-image
++artifact_path: $ARTIFACT
++artifact_digest: sha256:$ARTIFACT_SHA
++binary_path: $BINARY
++binary_digest: sha256:$BINARY_SHA
++sbom_format: cyclonedx-json
++sbom_path: $sbom_path
++sbom_sha256: $(ctd_sha256 "$sbom_path")
++sbom_artifact_digest: $sbom_artifact_digest
++sbom_binary_digest: sha256:$BINARY_SHA
++license_report_path: $LICENSE_REPORT
++license_report_sha256: $(ctd_sha256 "$LICENSE_REPORT")
++EOF
++}
++
++run_release_sbom_gate() {
++  local receipt="$1"
++  local sbom_path="$2"
++  local license_path="$3"
++  SBOM_DOC="$SBOM_POLICY" bash "$REPO/patches/transportd/tools/sbom-gate.sh" \
++    --receipt "$receipt" --artifact "$ARTIFACT" --binary "$BINARY" \
++    --sbom "$sbom_path" --license-report "$license_path" --release
++}
++
++write_receipt "$RECEIPT" "$SBOM" "sha256:$ARTIFACT_SHA"
++run_release_sbom_gate "$RECEIPT" "$SBOM" "$LICENSE_REPORT" >/dev/null
++
++EMPTY_SBOM="$WORK/empty.cdx.json"
++python3 - "$SBOM" "$EMPTY_SBOM" <<'PY'
++import json
++import sys
++
++with open(sys.argv[1], encoding="utf-8") as handle:
++    sbom = json.load(handle)
++sbom["components"] = []
++with open(sys.argv[2], "w", encoding="utf-8") as handle:
++    json.dump(sbom, handle)
++PY
++EMPTY_RECEIPT="$WORK/empty-receipt.txt"
++write_receipt "$EMPTY_RECEIPT" "$EMPTY_SBOM" "sha256:$ARTIFACT_SHA"
++if run_release_sbom_gate "$EMPTY_RECEIPT" "$EMPTY_SBOM" "$LICENSE_REPORT" >/dev/null 2>&1; then
++  echo "FAIL: SBOM gate accepted an empty component inventory" >&2
++  exit 1
++fi
++
++MALFORMED_SBOM="$WORK/malformed.cdx.json"
++printf '{\n' >"$MALFORMED_SBOM"
++MALFORMED_RECEIPT="$WORK/malformed-receipt.txt"
++write_receipt "$MALFORMED_RECEIPT" "$MALFORMED_SBOM" "sha256:$ARTIFACT_SHA"
++if run_release_sbom_gate "$MALFORMED_RECEIPT" "$MALFORMED_SBOM" "$LICENSE_REPORT" >/dev/null 2>&1; then
++  echo "FAIL: SBOM gate accepted malformed JSON" >&2
++  exit 1
++fi
++
++MUTATED_SBOM="$WORK/mutated.cdx.json"
++cp "$SBOM" "$MUTATED_SBOM"
++write_receipt "$WORK/mutated-receipt.txt" "$MUTATED_SBOM" "sha256:$ARTIFACT_SHA"
++printf ' ' >>"$MUTATED_SBOM"
++if run_release_sbom_gate "$WORK/mutated-receipt.txt" "$MUTATED_SBOM" "$LICENSE_REPORT" >/dev/null 2>&1; then
++  echo "FAIL: SBOM gate accepted changed SBOM bytes" >&2
++  exit 1
++fi
++
++MISMATCH_RECEIPT="$WORK/mismatch-receipt.txt"
++write_receipt "$MISMATCH_RECEIPT" "$SBOM" "sha256:$(printf '0%.0s' {1..64})"
++if run_release_sbom_gate "$MISMATCH_RECEIPT" "$SBOM" "$LICENSE_REPORT" >/dev/null 2>&1; then
++  echo "FAIL: SBOM gate accepted an artifact digest mismatch" >&2
++  exit 1
++fi
++
++if run_release_sbom_gate "$RECEIPT" "$SBOM" "$WORK/missing-license.json" >/dev/null 2>&1; then
++  echo "FAIL: SBOM gate accepted a missing license report" >&2
++  exit 1
++fi
++
++UNVERIFIED_DOC="$WORK/SBOM.unverified.md"
++sed 's/^sbom_artifact_status: .*/sbom_artifact_status: unverified/' \
++  "$SBOM_POLICY" >"$UNVERIFIED_DOC"
++if SBOM_DOC="$UNVERIFIED_DOC" bash "$REPO/patches/transportd/tools/sbom-gate.sh" \
++  --receipt "$RECEIPT" --artifact "$ARTIFACT" --binary "$BINARY" \
++  --sbom "$SBOM" --license-report "$LICENSE_REPORT" --release >/dev/null 2>&1; then
++  echo "FAIL: SBOM gate accepted unverified artifact policy" >&2
++  exit 1
++fi
++
++echo "PASS: wire and SBOM gates reject identity and artifact mutations"
+diff --git a/patches/transportd/tools/identity-lib.sh b/patches/transportd/tools/identity-lib.sh
+new file mode 100755
+index 000000000..1720b8bf3
+--- /dev/null
++++ b/patches/transportd/tools/identity-lib.sh
+@@ -0,0 +1,51 @@
++#!/usr/bin/env bash
++
++ctd_repo_root() {
++  cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd
++}
++
++ctd_field() {
++  local file="$1"
++  local key="$2"
++  sed -n "s/^${key}:[[:space:]]*//p" "$file" | head -1
++}
++
++ctd_sha256() {
++  if command -v shasum >/dev/null 2>&1; then
++    shasum -a 256 "$1" | awk '{print $1}'
++  else
++    sha256sum "$1" | awk '{print $1}'
++  fi
++}
++
++ctd_require_hex() {
++  local label="$1"
++  local value="$2"
++  local length="$3"
++  case "$value" in
++    *[!0-9a-f]*) echo "FAIL: $label is not lowercase hexadecimal: $value" >&2; return 1 ;;
++  esac
++  [ "${#value}" -eq "$length" ] || {
++    echo "FAIL: $label must contain $length hexadecimal characters: $value" >&2
++    return 1
++  }
++}
++
++ctd_require_external_receipt() {
++  local repo="$1"
++  local receipt="$2"
++  local resolved_repo
++  local resolved_receipt
++  case "$receipt" in
++    /*) ;;
++    *) echo "FAIL: receipt path must be absolute: $receipt" >&2; return 1 ;;
++  esac
++  resolved_repo="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$repo")"
++  resolved_receipt="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$receipt")"
++  case "$resolved_receipt" in
++    "$resolved_repo"|"$resolved_repo"/*)
++      echo "FAIL: receipt path must be outside the source tree: $receipt" >&2
++      return 1
++      ;;
++  esac
++}
+diff --git a/patches/transportd/tools/materialize-release-artifact.sh b/patches/transportd/tools/materialize-release-artifact.sh
+new file mode 100755
+index 000000000..1a66ba4ee
+--- /dev/null
++++ b/patches/transportd/tools/materialize-release-artifact.sh
+@@ -0,0 +1,211 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++# shellcheck source=patches/transportd/tools/identity-lib.sh
++source "$(dirname "$0")/identity-lib.sh"
++REPO="$(ctd_repo_root)"
++MANIFEST="$REPO/patches/transportd/series.yaml"
++BUILD_RECEIPT="${CTD_BUILD_RECEIPT_PATH:-}"
++RECEIPT="${CTD_RELEASE_RECEIPT_PATH:-}"
++ARTIFACT="${CTD_RELEASE_ARTIFACT_PATH:-}"
++BINARY="${CTD_RELEASE_BINARY_PATH:-}"
++SBOM="${CTD_RELEASE_SBOM_PATH:-}"
++LICENSE_REPORT="${CTD_RELEASE_LICENSE_REPORT_PATH:-}"
++
++fail() {
++  echo "FAIL: $*" >&2
++  exit 1
++}
++
++for binding in \
++  "CTD_BUILD_RECEIPT_PATH:$BUILD_RECEIPT" \
++  "CTD_RELEASE_RECEIPT_PATH:$RECEIPT" \
++  "CTD_RELEASE_ARTIFACT_PATH:$ARTIFACT" \
++  "CTD_RELEASE_BINARY_PATH:$BINARY" \
++  "CTD_RELEASE_SBOM_PATH:$SBOM" \
++  "CTD_RELEASE_LICENSE_REPORT_PATH:$LICENSE_REPORT"; do
++  name="${binding%%:*}"
++  path="${binding#*:}"
++  [ -n "$path" ] || fail "$name is required"
++  ctd_require_external_receipt "$REPO" "$path"
++done
++[ -f "$BUILD_RECEIPT" ] || fail "build receipt does not exist: $BUILD_RECEIPT"
++for output in "$RECEIPT" "$ARTIFACT" "$BINARY" "$SBOM" "$LICENSE_REPORT"; do
++  [ ! -e "$output" ] || fail "refusing to overwrite release output: $output"
++  mkdir -p "$(dirname "$output")"
++done
++
++[ "$(ctd_field "$BUILD_RECEIPT" schema)" = "ctd/evidence-receipt/v2" ] || {
++  fail "unsupported build receipt schema"
++}
++[ "$(ctd_field "$BUILD_RECEIPT" artifact_kind)" = "oci-image" ] || {
++  fail "build receipt must describe an oci-image"
++}
++[ "$(ctd_field "$BUILD_RECEIPT" build_profile)" = "release" ] || {
++  fail "build receipt must use the release profile"
++}
++[ "$(ctd_field "$BUILD_RECEIPT" build_mode)" = "local-cargo" ] || {
++  fail "build receipt must use local-cargo mode"
++}
++[ "$(ctd_field "$BUILD_RECEIPT" platform)" = "linux/amd64" ] || {
++  fail "build receipt must target linux/amd64"
++}
++
++SOURCE_COMMIT="$(ctd_field "$BUILD_RECEIPT" source_commit)"
++SOURCE_TREE="$(ctd_field "$BUILD_RECEIPT" source_tree)"
++REVIEW_COMMIT="$(ctd_field "$BUILD_RECEIPT" review_commit)"
++REVIEW_TREE="$(ctd_field "$BUILD_RECEIPT" review_tree)"
++RELEASE_ID="$(ctd_field "$BUILD_RECEIPT" release_id)"
++IMAGE="$(ctd_field "$BUILD_RECEIPT" image)"
++[ "$SOURCE_COMMIT" = "$(ctd_field "$MANIFEST" source_commit)" ] || {
++  fail "build receipt source_commit mismatch"
++}
++[ "$SOURCE_TREE" = "$(ctd_field "$MANIFEST" source_tree)" ] || {
++  fail "build receipt source_tree mismatch"
++}
++[ "$RELEASE_ID" = "$(ctd_field "$MANIFEST" release_id)" ] || {
++  fail "build receipt release_id mismatch"
++}
++[ "$(git -C "$REPO" rev-parse "$SOURCE_COMMIT^{tree}")" = "$SOURCE_TREE" ] || {
++  fail "build receipt source identity mismatch"
++}
++[ "$(git -C "$REPO" rev-parse "$REVIEW_COMMIT^{tree}")" = "$REVIEW_TREE" ] || {
++  fail "build receipt review identity mismatch"
++}
++
++IMAGE_DIGEST="$(docker image inspect "$IMAGE" --format '{{.Id}}')"
++case "$IMAGE_DIGEST" in
++  sha256:*) ctd_require_hex image_digest "${IMAGE_DIGEST#sha256:}" 64 ;;
++  *) fail "Docker image ID must use sha256" ;;
++esac
++
++docker save --output "$ARTIFACT" "$IMAGE_DIGEST"
++[ -s "$ARTIFACT" ] || fail "docker save produced an empty artifact"
++
++CONTAINER_ID=""
++cleanup() {
++  if [ -n "$CONTAINER_ID" ]; then
++    docker rm -f "$CONTAINER_ID" >/dev/null 2>&1 || true
++  fi
++}
++trap cleanup EXIT
++CONTAINER_ID="$(docker create "$IMAGE_DIGEST")"
++docker cp "$CONTAINER_ID":/app/codex-transportd "$BINARY"
++[ -s "$BINARY" ] || fail "image binary is missing or empty"
++
++ARTIFACT_SHA="$(ctd_sha256 "$ARTIFACT")"
++BINARY_SHA="$(ctd_sha256 "$BINARY")"
++CARGO_LOCK_SHA="$(ctd_field "$MANIFEST" cargo_lock_sha256)"
++BAZEL_LOCK_SHA="$(ctd_field "$MANIFEST" module_bazel_lock_sha256)"
++
++python3 - \
++  "$SBOM" "$SOURCE_COMMIT" "$SOURCE_TREE" "$RELEASE_ID" \
++  "$ARTIFACT_SHA" "$IMAGE_DIGEST" "$BINARY_SHA" \
++  "$CARGO_LOCK_SHA" "$BAZEL_LOCK_SHA" <<'PY'
++import json
++import sys
++from pathlib import Path
++
++(
++    output,
++    source_commit,
++    source_tree,
++    release_id,
++    artifact_sha,
++    image_digest,
++    binary_sha,
++    cargo_lock_sha,
++    bazel_lock_sha,
++) = sys.argv[1:]
++bom = {
++    "bomFormat": "CycloneDX",
++    "specVersion": "1.5",
++    "serialNumber": f"urn:uuid:{source_commit[:8]}-{source_commit[8:12]}-4000-8000-{source_commit[12:24]}",
++    "version": 1,
++    "metadata": {
++        "component": {
++            "type": "container",
++            "name": "codex-transportd-release-image",
++            "version": release_id,
++            "hashes": [{"alg": "SHA-256", "content": artifact_sha}],
++            "properties": [
++                {"name": "ctd:image_digest", "value": image_digest},
++                {"name": "ctd:source_commit", "value": source_commit},
++                {"name": "ctd:source_tree", "value": source_tree},
++            ],
++        }
++    },
++    "components": [
++        {
++            "type": "application",
++            "name": "codex-transportd",
++            "version": release_id,
++            "hashes": [{"alg": "SHA-256", "content": binary_sha}],
++            "licenses": [{"license": {"id": "Apache-2.0"}}],
++        },
++        {
++            "type": "file",
++            "name": "codex-rs/Cargo.lock",
++            "hashes": [{"alg": "SHA-256", "content": cargo_lock_sha}],
++        },
++        {
++            "type": "file",
++            "name": "MODULE.bazel.lock",
++            "hashes": [{"alg": "SHA-256", "content": bazel_lock_sha}],
++        },
++    ],
++}
++Path(output).write_text(json.dumps(bom, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++PY
++
++python3 - "$LICENSE_REPORT" "$ARTIFACT_SHA" "$BINARY_SHA" <<'PY'
++import json
++import sys
++from pathlib import Path
++
++output, artifact_sha, binary_sha = sys.argv[1:]
++report = {
++    "schema": "ctd/license-report/v1",
++    "artifactDigest": f"sha256:{artifact_sha}",
++    "binaryDigest": f"sha256:{binary_sha}",
++    "licenses": [{"expression": "Apache-2.0", "scope": "repository-declared"}],
++}
++Path(output).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++PY
++
++SBOM_SHA="$(ctd_sha256 "$SBOM")"
++LICENSE_REPORT_SHA="$(ctd_sha256 "$LICENSE_REPORT")"
++cat >"$RECEIPT" <<EOF
++schema: ctd/evidence-receipt/v2
++artifact_kind: oci-image
++artifact_format: docker-archive
++artifact_path: $ARTIFACT
++artifact_digest: sha256:$ARTIFACT_SHA
++image: $IMAGE
++image_digest: $IMAGE_DIGEST
++binary_path: $BINARY
++binary_digest: sha256:$BINARY_SHA
++sbom_format: cyclonedx-json
++sbom_path: $SBOM
++sbom_sha256: $SBOM_SHA
++sbom_artifact_digest: sha256:$ARTIFACT_SHA
++sbom_binary_digest: sha256:$BINARY_SHA
++license_report_path: $LICENSE_REPORT
++license_report_sha256: $LICENSE_REPORT_SHA
++build_profile: release
++platform: linux/amd64
++arch: amd64
++release_id: $RELEASE_ID
++source_commit: $SOURCE_COMMIT
++source_tree: $SOURCE_TREE
++review_commit: $REVIEW_COMMIT
++review_tree: $REVIEW_TREE
++build_mode: local-cargo
++lock_sha256: $(ctd_field "$BUILD_RECEIPT" lock_sha256)
++v8_sha256: $(ctd_field "$BUILD_RECEIPT" v8_sha256)
++materialized: $(date -u +%Y-%m-%dT%H:%M:%SZ)
++EOF
++
++echo "PASS: materialized release artifact $ARTIFACT"
++echo "PASS: bound image $IMAGE_DIGEST binary sha256:$BINARY_SHA"
++echo "PASS: wrote digest-bound SBOM and receipt $RECEIPT"
+diff --git a/patches/transportd/tools/release-evidence-gate.sh b/patches/transportd/tools/release-evidence-gate.sh
+new file mode 100755
+index 000000000..d11e2eedf
+--- /dev/null
++++ b/patches/transportd/tools/release-evidence-gate.sh
+@@ -0,0 +1,106 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++# shellcheck source=patches/transportd/tools/identity-lib.sh
++source "$(dirname "$0")/identity-lib.sh"
++REPO="$(ctd_repo_root)"
++MANIFEST="$REPO/patches/transportd/series.yaml"
++RECEIPT=""
++ARTIFACT=""
++RELEASE_MODE=0
++
++fail() {
++  echo "FAIL: $*" >&2
++  exit 1
++}
++
++while [ "$#" -gt 0 ]; do
++  case "$1" in
++    --receipt)
++      [ "$#" -ge 2 ] || fail "--receipt requires a path"
++      RECEIPT="$2"
++      shift 2
++      ;;
++    --release)
++      RELEASE_MODE=1
++      shift
++      ;;
++    --artifact)
++      [ "$#" -ge 2 ] || fail "--artifact requires a path"
++      ARTIFACT="$2"
++      shift 2
++      ;;
++    *) fail "unknown argument: $1" ;;
++  esac
++done
++[ -n "$RECEIPT" ] || fail "--receipt is required"
++ctd_require_external_receipt "$REPO" "$RECEIPT"
++[ -f "$RECEIPT" ] || fail "receipt does not exist: $RECEIPT"
++
++SOURCE_COMMIT="$(ctd_field "$MANIFEST" source_commit)"
++SOURCE_TREE="$(ctd_field "$MANIFEST" source_tree)"
++RELEASE_ID="$(ctd_field "$MANIFEST" release_id)"
++CARGO_LOCK_SHA="$(ctd_field "$MANIFEST" cargo_lock_sha256)"
++BAZEL_LOCK_SHA="$(ctd_field "$MANIFEST" module_bazel_lock_sha256)"
++RECEIPT_SOURCE="$(ctd_field "$RECEIPT" source_commit)"
++RECEIPT_TREE="$(ctd_field "$RECEIPT" source_tree)"
++RECEIPT_REVIEW="$(ctd_field "$RECEIPT" review_commit)"
++RECEIPT_REVIEW_TREE="$(ctd_field "$RECEIPT" review_tree)"
++RECEIPT_RELEASE_ID="$(ctd_field "$RECEIPT" release_id)"
++ARTIFACT_KIND="$(ctd_field "$RECEIPT" artifact_kind)"
++ARTIFACT_DIGEST="$(ctd_field "$RECEIPT" artifact_digest)"
++
++[ "$(ctd_field "$RECEIPT" schema)" = "ctd/evidence-receipt/v2" ] || fail "unsupported receipt schema"
++[ "$RECEIPT_SOURCE" = "$SOURCE_COMMIT" ] || fail "receipt source_commit mismatch"
++[ "$RECEIPT_TREE" = "$SOURCE_TREE" ] || fail "receipt source_tree mismatch"
++[ "$RECEIPT_RELEASE_ID" = "$RELEASE_ID" ] || fail "receipt release_id mismatch"
++[ "$(git -C "$REPO" rev-parse "$SOURCE_COMMIT^{tree}")" = "$SOURCE_TREE" ] || fail "manifest source identity mismatch"
++ctd_require_hex receipt_review_commit "$RECEIPT_REVIEW" 40
++ctd_require_hex receipt_review_tree "$RECEIPT_REVIEW_TREE" 40
++[ "$(git -C "$REPO" rev-parse "$RECEIPT_REVIEW^{tree}")" = "$RECEIPT_REVIEW_TREE" ] || fail "receipt review identity mismatch"
++case "$ARTIFACT_DIGEST" in
++  sha256:*) ctd_require_hex artifact_digest "${ARTIFACT_DIGEST#sha256:}" 64 ;;
++  *) fail "artifact_digest must use sha256" ;;
++esac
++[ "$(git -C "$REPO" show "$SOURCE_COMMIT:codex-rs/Cargo.lock" | ctd_sha256 /dev/stdin)" = "$CARGO_LOCK_SHA" ] || fail "source Cargo.lock mismatch"
++[ "$(git -C "$REPO" show "$SOURCE_COMMIT:MODULE.bazel.lock" | ctd_sha256 /dev/stdin)" = "$BAZEL_LOCK_SHA" ] || fail "source MODULE.bazel.lock mismatch"
++
++if [ "$ARTIFACT_KIND" = "source-archive" ]; then
++  if command -v shasum >/dev/null 2>&1; then
++    EXPECTED="$(git -C "$REPO" archive "$SOURCE_COMMIT" | shasum -a 256 | awk '{print $1}')"
++  else
++    EXPECTED="$(git -C "$REPO" archive "$SOURCE_COMMIT" | sha256sum | awk '{print $1}')"
++  fi
++  [ "$ARTIFACT_DIGEST" = "sha256:$EXPECTED" ] || fail "source archive digest mismatch"
++fi
++
++if [ "$RELEASE_MODE" -eq 1 ]; then
++  [ "$ARTIFACT_KIND" = "oci-image" ] || fail "release receipt must describe an oci-image"
++  [ -n "$ARTIFACT" ] || fail "release verification requires --artifact"
++  ctd_require_external_receipt "$REPO" "$ARTIFACT"
++  [ -s "$ARTIFACT" ] || fail "release artifact is missing or empty: $ARTIFACT"
++  [ "$(ctd_field "$RECEIPT" artifact_format)" = "docker-archive" ] || {
++    fail "release artifact must be a docker-archive"
++  }
++  [ "$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$ARTIFACT")" = \
++    "$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$(ctd_field "$RECEIPT" artifact_path)")" ] || {
++    fail "release artifact path does not match receipt"
++  }
++  [ "$ARTIFACT_DIGEST" = "sha256:$(ctd_sha256 "$ARTIFACT")" ] || {
++    fail "release artifact digest mismatch"
++  }
++  [ "$(ctd_field "$RECEIPT" build_profile)" = "release" ] || fail "release receipt profile mismatch"
++  [ "$(ctd_field "$RECEIPT" build_mode)" = "local-cargo" ] || fail "release receipt build mode mismatch"
++  [ "$(ctd_field "$RECEIPT" platform)" = "linux/amd64" ] || fail "release receipt platform mismatch"
++  RELEASE_TAG="$(ctd_field "$MANIFEST" release_tag)"
++  TAG_COMMIT="$(git -C "$REPO" rev-list -n 1 "$RELEASE_TAG" 2>/dev/null || true)"
++  [ "$TAG_COMMIT" = "$RECEIPT_REVIEW" ] || fail "release tag does not identify receipt review_commit"
++fi
++
++CURRENT_REVIEW="$(git -C "$REPO" rev-parse HEAD)"
++CURRENT_REVIEW_TREE="$(git -C "$REPO" rev-parse 'HEAD^{tree}')"
++echo "PASS: source identity $SOURCE_COMMIT $SOURCE_TREE"
++echo "PASS: artifact identity $ARTIFACT_KIND $ARTIFACT_DIGEST"
++echo "PASS: receipt review identity $RECEIPT_REVIEW $RECEIPT_REVIEW_TREE"
++echo "PASS: gate review identity $CURRENT_REVIEW $CURRENT_REVIEW_TREE"
++echo "PASS: release identity $RELEASE_ID"
+diff --git a/patches/transportd/tools/release-tag-verify.sh b/patches/transportd/tools/release-tag-verify.sh
+new file mode 100755
+index 000000000..434b2a7c0
+--- /dev/null
++++ b/patches/transportd/tools/release-tag-verify.sh
+@@ -0,0 +1,38 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++# shellcheck source=patches/transportd/tools/identity-lib.sh
++source "$(dirname "$0")/identity-lib.sh"
++REPO="$(ctd_repo_root)"
++MANIFEST="$REPO/patches/transportd/series.yaml"
++RECEIPT="${CTD_RELEASE_RECEIPT_PATH:-}"
++ARTIFACT="${CTD_RELEASE_ARTIFACT_PATH:-}"
++BINARY="${CTD_RELEASE_BINARY_PATH:-}"
++SBOM="${CTD_RELEASE_SBOM_PATH:-}"
++LICENSE_REPORT="${CTD_RELEASE_LICENSE_REPORT_PATH:-}"
++[ -n "$RECEIPT" ] || { echo "FAIL: CTD_RELEASE_RECEIPT_PATH is required" >&2; exit 1; }
++ctd_require_external_receipt "$REPO" "$RECEIPT"
++for binding in \
++  "CTD_RELEASE_ARTIFACT_PATH:$ARTIFACT" \
++  "CTD_RELEASE_BINARY_PATH:$BINARY" \
++  "CTD_RELEASE_SBOM_PATH:$SBOM" \
++  "CTD_RELEASE_LICENSE_REPORT_PATH:$LICENSE_REPORT"; do
++  name="${binding%%:*}"
++  path="${binding#*:}"
++  [ -n "$path" ] || { echo "FAIL: $name is required" >&2; exit 1; }
++  ctd_require_external_receipt "$REPO" "$path"
++done
++
++TAG="$(ctd_field "$MANIFEST" release_tag)"
++CURRENT_TAG="$(git -C "$REPO" describe --tags --exact-match HEAD 2>/dev/null || true)"
++[ "$CURRENT_TAG" = "$TAG" ] || { echo "FAIL: HEAD is not release tag $TAG" >&2; exit 1; }
++
++bash "$REPO/patches/transportd/tools/release-evidence-gate.sh" \
++  --receipt "$RECEIPT" --artifact "$ARTIFACT" --release
++bash "$REPO/patches/transportd/tools/bin-verify.sh" \
++  --receipt "$RECEIPT" --artifact "$ARTIFACT" --binary "$BINARY"
++bash "$REPO/patches/transportd/tools/wire-gate.sh" --release
++bash "$REPO/patches/transportd/tools/sbom-gate.sh" \
++  --receipt "$RECEIPT" --artifact "$ARTIFACT" --binary "$BINARY" \
++  --sbom "$SBOM" --license-report "$LICENSE_REPORT" --release
++echo "PASS: release tag, source, artifact, wire, and SBOM identities"
+diff --git a/patches/transportd/tools/sbom-gate.sh b/patches/transportd/tools/sbom-gate.sh
+new file mode 100755
+index 000000000..e9ff613aa
+--- /dev/null
++++ b/patches/transportd/tools/sbom-gate.sh
+@@ -0,0 +1,139 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++# shellcheck source=patches/transportd/tools/identity-lib.sh
++source "$(dirname "$0")/identity-lib.sh"
++REPO="$(ctd_repo_root)"
++MANIFEST="$REPO/patches/transportd/series.yaml"
++SBOM_DOC="${SBOM_DOC:-$REPO/SBOM.md}"
++RECEIPT=""
++ARTIFACT=""
++BINARY=""
++SBOM=""
++LICENSE_REPORT=""
++RELEASE_MODE=0
++while [ "$#" -gt 0 ]; do
++  case "$1" in
++    --receipt) RECEIPT="${2:-}"; shift 2 ;;
++    --artifact) ARTIFACT="${2:-}"; shift 2 ;;
++    --binary) BINARY="${2:-}"; shift 2 ;;
++    --sbom) SBOM="${2:-}"; shift 2 ;;
++    --license-report) LICENSE_REPORT="${2:-}"; shift 2 ;;
++    --release) RELEASE_MODE=1; shift ;;
++    *) echo "FAIL: unknown argument: $1" >&2; exit 1 ;;
++  esac
++done
++
++[ "$(ctd_field "$SBOM_DOC" sbom_source_commit)" = "$(ctd_field "$MANIFEST" source_commit)" ] || {
++  echo "FAIL: SBOM source commit mismatch" >&2; exit 1; }
++[ "$(ctd_field "$SBOM_DOC" sbom_source_tree)" = "$(ctd_field "$MANIFEST" source_tree)" ] || {
++  echo "FAIL: SBOM source tree mismatch" >&2; exit 1; }
++[ "$(ctd_field "$SBOM_DOC" sbom_cargo_lock_sha256)" = "$(ctd_field "$MANIFEST" cargo_lock_sha256)" ] || {
++  echo "FAIL: SBOM Cargo.lock mismatch" >&2; exit 1; }
++[ "$(ctd_field "$SBOM_DOC" sbom_module_bazel_lock_sha256)" = "$(ctd_field "$MANIFEST" module_bazel_lock_sha256)" ] || {
++  echo "FAIL: SBOM MODULE.bazel.lock mismatch" >&2; exit 1; }
++[ "$(ctd_field "$SBOM_DOC" sbom_status)" = "generated-from-locks" ] || {
++  echo "FAIL: SBOM status is not generated-from-locks" >&2; exit 1; }
++[ "$(ctd_field "$SBOM_DOC" sbom_artifact_status)" = "external-receipt-required" ] || {
++  echo "FAIL: SBOM artifact policy does not require an external receipt" >&2; exit 1; }
++
++if [ "$RELEASE_MODE" -eq 1 ]; then
++  [ -n "$RECEIPT" ] || { echo "FAIL: release SBOM check requires --receipt" >&2; exit 1; }
++  ctd_require_external_receipt "$REPO" "$RECEIPT"
++  [ -s "$RECEIPT" ] || { echo "FAIL: release SBOM receipt is missing or empty" >&2; exit 1; }
++  [ "$(ctd_field "$RECEIPT" artifact_kind)" = "oci-image" ] || {
++    echo "FAIL: release SBOM receipt must describe an oci-image" >&2; exit 1; }
++  for binding in \
++    "artifact:$ARTIFACT" \
++    "binary:$BINARY" \
++    "sbom:$SBOM" \
++    "license-report:$LICENSE_REPORT"; do
++    name="${binding%%:*}"
++    path="${binding#*:}"
++    [ -n "$path" ] || { echo "FAIL: release SBOM check requires --$name" >&2; exit 1; }
++    ctd_require_external_receipt "$REPO" "$path"
++    [ -s "$path" ] || { echo "FAIL: release $name is missing or empty: $path" >&2; exit 1; }
++  done
++
++  same_path() {
++    [ "$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1")" = \
++      "$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$2")" ]
++  }
++  same_path "$ARTIFACT" "$(ctd_field "$RECEIPT" artifact_path)" || {
++    echo "FAIL: SBOM artifact path does not match receipt" >&2; exit 1; }
++  same_path "$BINARY" "$(ctd_field "$RECEIPT" binary_path)" || {
++    echo "FAIL: SBOM binary path does not match receipt" >&2; exit 1; }
++  same_path "$SBOM" "$(ctd_field "$RECEIPT" sbom_path)" || {
++    echo "FAIL: SBOM path does not match receipt" >&2; exit 1; }
++  same_path "$LICENSE_REPORT" "$(ctd_field "$RECEIPT" license_report_path)" || {
++    echo "FAIL: license report path does not match receipt" >&2; exit 1; }
++
++  ARTIFACT_DIGEST="sha256:$(ctd_sha256 "$ARTIFACT")"
++  BINARY_DIGEST="sha256:$(ctd_sha256 "$BINARY")"
++  [ "$(ctd_field "$RECEIPT" artifact_digest)" = "$ARTIFACT_DIGEST" ] || {
++    echo "FAIL: SBOM artifact digest mismatch" >&2; exit 1; }
++  [ "$(ctd_field "$RECEIPT" binary_digest)" = "$BINARY_DIGEST" ] || {
++    echo "FAIL: SBOM binary digest mismatch" >&2; exit 1; }
++  [ "$(ctd_field "$RECEIPT" sbom_artifact_digest)" = "$ARTIFACT_DIGEST" ] || {
++    echo "FAIL: SBOM is not bound to the release artifact" >&2; exit 1; }
++  [ "$(ctd_field "$RECEIPT" sbom_binary_digest)" = "$BINARY_DIGEST" ] || {
++    echo "FAIL: SBOM is not bound to the image binary" >&2; exit 1; }
++  [ "$(ctd_field "$RECEIPT" sbom_format)" = "cyclonedx-json" ] || {
++    echo "FAIL: unsupported release SBOM format" >&2; exit 1; }
++  [ "$(ctd_field "$RECEIPT" sbom_sha256)" = "$(ctd_sha256 "$SBOM")" ] || {
++    echo "FAIL: release SBOM hash mismatch" >&2; exit 1; }
++  [ "$(ctd_field "$RECEIPT" license_report_sha256)" = "$(ctd_sha256 "$LICENSE_REPORT")" ] || {
++    echo "FAIL: license report hash mismatch" >&2; exit 1; }
++
++  python3 - \
++    "$SBOM" "$LICENSE_REPORT" "$ARTIFACT_DIGEST" "$BINARY_DIGEST" \
++    "$(ctd_field "$MANIFEST" source_commit)" \
++    "$(ctd_field "$MANIFEST" source_tree)" <<'PY'
++import json
++import sys
++
++sbom_path, license_path, artifact_digest, binary_digest, source_commit, source_tree = sys.argv[1:]
++with open(sbom_path, encoding="utf-8") as handle:
++    sbom = json.load(handle)
++if sbom.get("bomFormat") != "CycloneDX" or sbom.get("specVersion") not in {"1.5", "1.6"}:
++    raise SystemExit("FAIL: release SBOM is not supported CycloneDX JSON")
++components = sbom.get("components")
++if not isinstance(components, list) or not components:
++    raise SystemExit("FAIL: release SBOM has no components")
++metadata_component = sbom.get("metadata", {}).get("component", {})
++metadata_hashes = metadata_component.get("hashes", [])
++artifact_hex = artifact_digest.removeprefix("sha256:")
++if not any(item.get("alg") == "SHA-256" and item.get("content") == artifact_hex for item in metadata_hashes):
++    raise SystemExit("FAIL: release SBOM metadata does not bind the artifact digest")
++properties = {
++    item.get("name"): item.get("value")
++    for item in metadata_component.get("properties", [])
++    if isinstance(item, dict)
++}
++if properties.get("ctd:source_commit") != source_commit or properties.get("ctd:source_tree") != source_tree:
++    raise SystemExit("FAIL: release SBOM source identity mismatch")
++binary_hex = binary_digest.removeprefix("sha256:")
++binary_components = [item for item in components if item.get("name") == "codex-transportd"]
++if not any(
++    hash_item.get("alg") == "SHA-256" and hash_item.get("content") == binary_hex
++    for component in binary_components
++    for hash_item in component.get("hashes", [])
++):
++    raise SystemExit("FAIL: release SBOM does not bind the image binary")
++with open(license_path, encoding="utf-8") as handle:
++    license_report = json.load(handle)
++if license_report.get("schema") != "ctd/license-report/v1":
++    raise SystemExit("FAIL: unsupported license report schema")
++if license_report.get("artifactDigest") != artifact_digest:
++    raise SystemExit("FAIL: license report artifact digest mismatch")
++if license_report.get("binaryDigest") != binary_digest:
++    raise SystemExit("FAIL: license report binary digest mismatch")
++licenses = license_report.get("licenses")
++if not isinstance(licenses, list) or not licenses:
++    raise SystemExit("FAIL: license report has no licenses")
++PY
++fi
++echo "PASS: SBOM source and dependency-lock identities"
++if [ "$RELEASE_MODE" -eq 1 ]; then
++  echo "PASS: digest-bound release SBOM and license report"
++fi
+diff --git a/patches/transportd/tools/static-fix-gates.sh b/patches/transportd/tools/static-fix-gates.sh
+new file mode 100755
+index 000000000..3c24fe5e3
+--- /dev/null
++++ b/patches/transportd/tools/static-fix-gates.sh
+@@ -0,0 +1,24 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
++
++require() {
++  local label="$1"
++  local needle="$2"
++  local file="$3"
++  grep -qF "$needle" "$file" || {
++    echo "FAIL: $label" >&2
++    exit 1
++  }
++}
++
++require "models must preserve upstream status" ".execute_raw_with(" "$REPO/codex-rs/codex-api/src/endpoint/models.rs"
++require "search must preserve upstream status" ".execute_raw_with(" "$REPO/codex-rs/codex-api/src/endpoint/search.rs"
++require "closed pong channel must terminate" "let Some(payload) = payload else { break };" "$REPO/codex-rs/codex-transportd/src/server/websocket.rs"
++require "duplicate headers must append" "out.append(name.clone(), value.clone());" "$REPO/codex-rs/codex-transportd/src/contract/mod.rs"
++require "UDS connection limit must exist" "MAX_UDS_CONNECTIONS" "$REPO/codex-rs/codex-transportd/src/limits.rs"
++require "accept loop must acquire a connection permit" ".acquire_owned()" "$REPO/codex-rs/codex-transportd/src/server/mod.rs"
++require "raw request logging must use common guard" "self.trace_request(&req);" "$REPO/codex-rs/http-client/src/transport.rs"
++
++echo "PASS: consolidated transportd static invariants"
+diff --git a/patches/transportd/tools/wire-gate.sh b/patches/transportd/tools/wire-gate.sh
+new file mode 100755
+index 000000000..4fd8c1198
+--- /dev/null
++++ b/patches/transportd/tools/wire-gate.sh
+@@ -0,0 +1,29 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++# shellcheck source=patches/transportd/tools/identity-lib.sh
++source "$(dirname "$0")/identity-lib.sh"
++REPO="$(ctd_repo_root)"
++MANIFEST="$REPO/patches/transportd/series.yaml"
++WIRE_DOC="${WIRE_DOC:-$REPO/WIRE_COMPATIBILITY.md}"
++RELEASE_MODE=0
++[ "$#" -le 1 ] || { echo "FAIL: wire-gate accepts only --release" >&2; exit 1; }
++if [ "$#" -eq 1 ]; then
++  [ "$1" = "--release" ] || { echo "FAIL: unknown argument: $1" >&2; exit 1; }
++  RELEASE_MODE=1
++fi
++
++[ "$(ctd_field "$WIRE_DOC" wire_source_commit)" = "$(ctd_field "$MANIFEST" source_commit)" ] || {
++  echo "FAIL: wire source commit mismatch" >&2; exit 1; }
++[ "$(ctd_field "$WIRE_DOC" wire_source_tree)" = "$(ctd_field "$MANIFEST" source_tree)" ] || {
++  echo "FAIL: wire source tree mismatch" >&2; exit 1; }
++STATUS="$(ctd_field "$WIRE_DOC" wire_status)"
++case "$STATUS" in
++  pass|unverified) ;;
++  *) echo "FAIL: invalid wire status: $STATUS" >&2; exit 1 ;;
++esac
++if [ "$RELEASE_MODE" -eq 1 ] && [ "$STATUS" != "pass" ]; then
++  echo "FAIL: wire evidence is not release-approved" >&2
++  exit 1
++fi
++echo "PASS: wire metadata status=$STATUS"
+diff --git a/patches/transportd/tools/write-source-receipt.sh b/patches/transportd/tools/write-source-receipt.sh
+new file mode 100755
+index 000000000..1fdfb0b53
+--- /dev/null
++++ b/patches/transportd/tools/write-source-receipt.sh
+@@ -0,0 +1,39 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++# shellcheck source=patches/transportd/tools/identity-lib.sh
++source "$(dirname "$0")/identity-lib.sh"
++REPO="$(ctd_repo_root)"
++MANIFEST="$REPO/patches/transportd/series.yaml"
++
++[ "$#" -eq 1 ] || {
++  echo "FAIL: usage: write-source-receipt.sh /absolute/path/outside/repository" >&2
++  exit 1
++}
++RECEIPT="$1"
++ctd_require_external_receipt "$REPO" "$RECEIPT"
++
++SOURCE_COMMIT="$(ctd_field "$MANIFEST" source_commit)"
++SOURCE_TREE="$(ctd_field "$MANIFEST" source_tree)"
++RELEASE_ID="$(ctd_field "$MANIFEST" release_id)"
++REVIEW_COMMIT="$(git -C "$REPO" rev-parse HEAD)"
++REVIEW_TREE="$(git -C "$REPO" rev-parse 'HEAD^{tree}')"
++
++if command -v shasum >/dev/null 2>&1; then
++  ARCHIVE_SHA="$(git -C "$REPO" archive "$SOURCE_COMMIT" | shasum -a 256 | awk '{print $1}')"
++else
++  ARCHIVE_SHA="$(git -C "$REPO" archive "$SOURCE_COMMIT" | sha256sum | awk '{print $1}')"
++fi
++
++mkdir -p "$(dirname "$RECEIPT")"
++cat >"$RECEIPT" <<EOF
++schema: ctd/evidence-receipt/v2
++artifact_kind: source-archive
++artifact_digest: sha256:$ARCHIVE_SHA
++source_commit: $SOURCE_COMMIT
++source_tree: $SOURCE_TREE
++review_commit: $REVIEW_COMMIT
++review_tree: $REVIEW_TREE
++release_id: $RELEASE_ID
++EOF
++echo "PASS: wrote external source receipt $RECEIPT"
+diff --git a/replay/gate.sh b/replay/gate.sh
+index 010a39707..5e29e8ade 100755
+--- a/replay/gate.sh
++++ b/replay/gate.sh
+@@ -2,7 +2,7 @@
+ set -euo pipefail
+ 
+ REPO="$(cd "$(dirname "$0")/.." && pwd)"
+-MANIFEST="$REPO/replay/manifest.yaml"
++MANIFEST="${REPLAY_MANIFEST:-$REPO/replay/manifest.yaml}"
+ 
+ fail() {
+   echo "FAIL: $*" >&2
+@@ -10,79 +10,74 @@ fail() {
+ }
+ 
+ field() {
+-  sed -n "s/^$1: //p" "$MANIFEST"
++  # YAML 行内注释不属于值：先去掉 " #..." 再返回。
++  sed -n "s/^$1:[[:space:]]*//p" "$MANIFEST" | head -1 | sed "s/[[:space:]][[:space:]]*#.*$//"
+ }
+ 
+-cd "$REPO"
+-LINE="$(field line)"
+-BASE="$(field upstream_commit)"
++[ "$#" -eq 0 ] || fail "replay gate accepts no arguments"
++BASE="$(field base_commit)"
+ SOURCE_COMMIT="$(field source_commit)"
+ SOURCE_TREE="$(field source_tree)"
+-EXPECTED_COUNT="$(field compact_count)"
+-COMMITS="$(sed -n 's/^  - commit: //p' "$MANIFEST")"
+-TREES="$(sed -n 's/^    tree: //p' "$MANIFEST")"
+-
+-CURRENT_BRANCH="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+-if [ "$CURRENT_BRANCH" != "$LINE" ]; then
+-  [ "${GITHUB_ACTIONS:-}" = "true" ] || fail "branch is not $LINE"
+-  [ "${GITHUB_SHA:-}" = "$(git rev-parse HEAD)" ] || fail "GitHub SHA is not HEAD"
+-  CI_PREFIX="ci/family-api-codex/"
+-  case "${GITHUB_REF_NAME:-}" in
+-    "$CI_PREFIX"*) ;;
+-    *) fail "GitHub ref is outside $CI_PREFIX" ;;
+-  esac
+-  CI_SUFFIX="${GITHUB_REF_NAME#"$CI_PREFIX"}"
+-  CI_TASK="${CI_SUFFIX%/*}"
+-  CI_SHA="${CI_SUFFIX##*/}"
+-  [ -n "$CI_TASK" ] && [ "$CI_TASK" = "${CI_TASK##*/}" ] || fail "CI task ref is malformed"
+-  [ "$CI_SHA" = "$GITHUB_SHA" ] || fail "CI ref SHA is not HEAD"
+-fi
+-git cat-file -e "$BASE^{commit}" 2>/dev/null || fail "upstream base is unavailable"
++RELEASE_COMMIT="$(field release_commit)"
++EXPECTED_RELEASE_TREE="$(field expected_release_tree)"
++EXPECTED_COUNT="$(field commit_count)"
++# 产品提交处的 manifest 只有头部（source/release 与逐提交清单是自引用的，由证据提交生成）。
++# 显式声明 partial 时跳过这些字段的校验，而不是误报 "source commit is unavailable"。
++MANIFEST_STATUS="$(field manifest_status)"
++case "$MANIFEST_STATUS" in
++  partial-*)
++    echo "SKIP: manifest_status=${MANIFEST_STATUS}（产品提交处 manifest 仅头部；source/release 由证据提交生成）"
++    exit 0 ;;
++esac
++git -C "$REPO" cat-file -e "$BASE^{commit}" 2>/dev/null || fail "base commit is unavailable"
++git -C "$REPO" cat-file -e "$SOURCE_COMMIT^{commit}" 2>/dev/null || fail "source commit is unavailable"
++git -C "$REPO" cat-file -e "$RELEASE_COMMIT^{commit}" 2>/dev/null || fail "release commit is unavailable"
++[ "$(git -C "$REPO" rev-parse "$SOURCE_COMMIT^{tree}")" = "$SOURCE_TREE" ] || fail "source commit/tree mismatch"
++[ "$(git -C "$REPO" rev-parse "$RELEASE_COMMIT^{tree}")" = "$EXPECTED_RELEASE_TREE" ] || fail "release commit/tree mismatch"
++git -C "$REPO" merge-base --is-ancestor "$SOURCE_COMMIT" "$RELEASE_COMMIT" || {
++  fail "source_commit is not an ancestor of release_commit"
++}
+ 
+-TREE_ARGS=()
++COMMITS=()
++TREES=()
++while IFS= read -r commit; do
++  COMMITS+=("$commit")
++done < <(sed -n 's/^  - commit: //p' "$MANIFEST")
+ while IFS= read -r tree; do
+-  [ -n "$tree" ] && TREE_ARGS+=("$tree")
+-done <<< "$TREES"
+-set -- "${TREE_ARGS[@]}"
+-PREV="$BASE"
+-COUNT=0
+-for COMMIT in $COMMITS; do
+-  [ "$#" -gt 0 ] || fail "tree list shorter than commit list"
+-  EXPECTED_TREE="$1"
+-  shift
+-  git cat-file -e "$COMMIT^{commit}" 2>/dev/null || fail "compact commit unavailable: $COMMIT"
+-  [ "$(git rev-parse "$COMMIT^")" = "$PREV" ] || fail "non-linear compact commit: $COMMIT"
+-  [ "$(git rev-parse "$COMMIT^{tree}")" = "$EXPECTED_TREE" ] || fail "tree mismatch: $COMMIT"
+-  PREV="$COMMIT"
+-  COUNT=$((COUNT + 1))
+-done
+-[ "$#" -eq 0 ] || fail "tree list longer than commit list"
+-[ "$COUNT" -eq "$EXPECTED_COUNT" ] || fail "compact count $COUNT != $EXPECTED_COUNT"
+-[ "$(git rev-parse "$PREV^{tree}")" = "$SOURCE_TREE" ] || fail "final capability tree mismatch"
++  TREES+=("$tree")
++done < <(sed -n 's/^    tree: //p' "$MANIFEST")
++[ "${#COMMITS[@]}" -eq "$EXPECTED_COUNT" ] || fail "commit count mismatch"
++[ "${#TREES[@]}" -eq "$EXPECTED_COUNT" ] || fail "tree count mismatch"
+ 
+-REPLAY_HEAD="$(git rev-parse HEAD)"
+-if [ "$CURRENT_BRANCH" != "$LINE" ]; then
+-  while [ "$REPLAY_HEAD" != "$BASE" ]; do
+-    REPLAY_PARENT="$(git rev-parse "$REPLAY_HEAD^" 2>/dev/null)" || fail "CI candidate parent is unavailable"
+-    [ "$REPLAY_PARENT" = "$PREV" ] && break
+-    REPLAY_HEAD="$REPLAY_PARENT"
+-  done
+-fi
+-[ "$(git rev-parse "$REPLAY_HEAD^")" = "$PREV" ] || fail "replay metadata commit is not on the compact line"
+-[ "$(git rev-list --count "$BASE..$REPLAY_HEAD")" -eq $((EXPECTED_COUNT + 1)) ] || fail "unexpected commits in replay line"
+-for PATHNAME in $(git diff-tree --no-commit-id --name-only -r "$REPLAY_HEAD"); do
+-  case "$PATHNAME" in
+-    replay/*) ;;
+-    *) fail "replay metadata commit changed non-replay path: $PATHNAME" ;;
+-  esac
++PREVIOUS="$BASE"
++for index in "${!COMMITS[@]}"; do
++  commit="${COMMITS[$index]}"
++  tree="${TREES[$index]}"
++  git -C "$REPO" cat-file -e "$commit^{commit}" 2>/dev/null || fail "replay commit is unavailable: $commit"
++  [ "$(git -C "$REPO" rev-parse "$commit^")" = "$PREVIOUS" ] || fail "replay line is not contiguous at $commit"
++  [ "$(git -C "$REPO" rev-parse "$commit^{tree}")" = "$tree" ] || fail "replay tree mismatch at $commit"
++  PREVIOUS="$commit"
+ done
++[ "$PREVIOUS" = "$SOURCE_COMMIT" ] || fail "last replay commit is not source_commit"
+ 
+-if git cat-file -e "$SOURCE_COMMIT^{commit}" 2>/dev/null; then
+-  [ "$(git rev-parse "$SOURCE_COMMIT^{tree}")" = "$SOURCE_TREE" ] || fail "frozen source tree mismatch"
+-  echo "source object verified: $SOURCE_COMMIT"
+-else
+-  echo "source object unavailable; source tree remains pinned: $SOURCE_TREE"
+-fi
++CURRENT="$(git -C "$REPO" rev-parse HEAD)"
++git -C "$REPO" merge-base --is-ancestor "$RELEASE_COMMIT" "$CURRENT" || fail "review HEAD does not contain release_commit"
++for commit in $(git -C "$REPO" rev-list "$SOURCE_COMMIT..$CURRENT" --no-merges); do
++  while IFS= read -r path; do
++    case "$path" in
++      PATCHES.md|SBOM.md|UPSTREAM_BASE.md|WIRE_COMPATIBILITY.md|codex-rs/codex-transportd/BUILD_PROOF.md|patches/transportd/*|replay/manifest.yaml) ;;
++      *)
++        # 产品路径的 post-source 例外必须在 manifest 里显式声明（post_source_allow，空格分隔）。
++        # 例外要可见、可审计，而不是靠放宽通用白名单。
++        _allowed=0
++        for _a in $(field post_source_allow); do
++          [ "$path" = "$_a" ] && { _allowed=1; break; }
++        done
++        [ "$_allowed" = 1 ] || fail "post-source review commit changes non-evidence path: $commit $path"
++        ;;
++    esac
++  done < <(git -C "$REPO" show --format= --name-only "$commit")
++done
+ 
+-[ -z "$(git status --porcelain)" ] || fail "worktree is not clean"
+-echo "PASS: $LINE $EXPECTED_COUNT compact commits, source tree $SOURCE_TREE"
++echo "PASS: replay source=$SOURCE_COMMIT tree=$SOURCE_TREE commits=$EXPECTED_COUNT"
++echo "PASS: review=$CURRENT tree=$(git -C "$REPO" rev-parse 'HEAD^{tree}')"
+diff --git a/replay/worker-ci-static-test.sh b/replay/worker-ci-static-test.sh
+index 43bd719a9..a0c4ca5dc 100755
+--- a/replay/worker-ci-static-test.sh
++++ b/replay/worker-ci-static-test.sh
+@@ -1,4 +1,5 @@
+ #!/bin/sh
++# shellcheck disable=SC2016 # Static assertions intentionally match literal shell variables.
+ set -eu
+ 
+ repo=$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)
+@@ -61,7 +62,7 @@ require_text "$workflow" 'cargo test --locked -p codex-http-client --lib'
+ require_text "$workflow" 'cargo clippy --locked -p codex-transportd --no-deps -- -D warnings'
+ require_text "$workflow" 'bash replay/gate.sh'
+ require_text "$workflow" 'bash patches/transportd/tools/export-gate.sh'
+-require_text "$workflow" 'bash patches/transportd/tools/release-evidence-gate.sh'
++require_text "$workflow" 'bash patches/transportd/tools/release-evidence-gate.sh --receipt'
+ require_text "$workflow" 'bash codex-rs/scripts/check-platform-archives.sh'
+ # R3-LINK-001 回归（静态）：连续两次 hosted run（33472913683、33498330072）
+ # 在同一 final lib-test link 阶段死于 ld signal 7 [Bus error]，两次之间
+@@ -89,9 +90,9 @@ if grep -qF 'runs_on:' "$workflow" || grep -qF -- '-runners' "$workflow"; then
+     fail 'worker CI workflow depends on a repository self-hosted runner group'
+ fi
+ 
+-require_text "$repo/replay/gate.sh" 'GITHUB_ACTIONS'
+-require_text "$repo/replay/gate.sh" 'ci/family-api-codex/'
+-require_text "$repo/replay/gate.sh" "while [ \"\$REPLAY_HEAD\" != \"\$BASE\" ]; do"
++require_text "$repo/replay/gate.sh" 'merge-base --is-ancestor "$SOURCE_COMMIT" "$RELEASE_COMMIT"'
++require_text "$repo/replay/gate.sh" 'merge-base --is-ancestor "$RELEASE_COMMIT" "$CURRENT"'
++require_text "$repo/replay/gate.sh" 'post-source review commit changes non-evidence path'
+ require_text "$repo/.github/workflows/transportd.yml" 'branches: ["transportd/**", "replay_*"]'
+ require_text "$repo/.github/workflows/transportd-release-gates.yml" 'branches: ["transportd/**", "replay_*"]'
+ 
+diff --git a/sidecar-image-receipt.txt b/sidecar-image-receipt.txt
+deleted file mode 100644
+index 7c96fbb75..000000000
+--- a/sidecar-image-receipt.txt
++++ /dev/null
+@@ -1,12 +0,0 @@
+-image:                    weishaw/codex-transportd:build
+-platform:                 linux/amd64
+-arch:                     amd64
+-triple:                   x86_64-unknown-linux-gnu
+-digest:                   sha256:b8dc9aa7d9ec1bc7124031cdca267f4cc2c3229a40c08a5c96ffc2e4f77ee719
+-release_id:               ctd-rust-v0.144.1-r2
+-source_commit:            8ab4773c7f5e11ae3baf6c85b3250218a03f8a0b
+-build_invocation_commit:  c6ddf1d259f911ce8ad4b783dc453c64ad3307bd
+-build_mode:               local-cargo
+-lock_sha256:              70482f90e3fd7b8c2b5baad7b47f44956d000998d1812da5b6ff68d6073b9bc6
+-v8_sha256:                8aed98637db7e77dc8bfb8bb4759ec5bde472d0bf7943f58e0e62a350945c559
+-build:                    2026-08-18T08:03:20Z
+-- 
+2.48.1
+

@@ -1,0 +1,82 @@
+# transportd release gates（R8）：CI 不能在任何 release gate 未闭合时
+# 批准发布。两个 job 严格分离：
+#
+#   pre-release-gates   — push/branch（transportd/**）：export gate +
+#                         pre-release evidence gate + 本静态测试。
+#                         pre-release 绝不构成 release 批准。
+#   release-approval    — 仅 tag（transportd/**）：release-tag-verify
+#                         （release 旗标由脚本内部调用）+ wire gate + SBOM gate。
+#
+# 不可变输入约束（R8 / F-0003 / F-0004）：
+#   - 零外部 Action（无 uses:）——不存在可漂移的第三方引用；
+#   - 工具链由仓库内 rust-toolchain.toml 精确固定（1.95.0），rustup 自动解析；
+#   - 任何 gate step 禁止错误吞没开关（失败即红）；
+#   - release-tag-verify.sh 以默认声明 tag 调用（不接受 release 旗标参数）；
+#   - 本文件任何位置不得出现 release 旗标字面量（由 ci-gates-static-test.sh 拒绝）。
+name: transportd-release-gates
+
+on:
+  pull_request:
+    branches: ["transportd/**", "replay_*"]
+  push:
+    branches: ["transportd/**", "replay_*"]
+    tags: ["transportd/**"]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "2"
+
+jobs:
+  pre-release-gates:
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/'))
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout (full history for export replay)
+        run: |
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch origin --tags "+${GITHUB_REF}"
+          git checkout --force FETCH_HEAD
+      - name: Export gate（manifest 驱动系列完整性；summary 只读校验）
+        run: bash patches/transportd/tools/export-gate.sh
+      - name: Evidence gate（pre-release 模式；不构成 release 批准）
+        run: |
+          RECEIPT="${RUNNER_TEMP}/transportd-source-receipt.txt"
+          bash patches/transportd/tools/write-source-receipt.sh "$RECEIPT"
+          bash patches/transportd/tools/release-evidence-gate.sh --receipt "$RECEIPT"
+      - name: Static CI gate test（gate 集与模式分离的结构断言）
+        run: bash patches/transportd/tools/ci-gates-static-test.sh
+
+  release-approval-gates:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout tagged tree (full history)
+        run: |
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch origin --tags "+${GITHUB_REF}"
+          git checkout --force FETCH_HEAD
+      - name: Build exact release image and producer receipt
+        env:
+          CTD_RELEASE_RECEIPT_PATH: ${{ runner.temp }}/transportd-build-receipt.txt
+        run: |
+          BUILD_PROFILE=release bash deploy/build-sidecar.sh prepare
+          BUILD_PROFILE=release bash deploy/build-sidecar.sh build --mode local-cargo
+      - name: Materialize image archive, binary, SBOM, and release receipt
+        env:
+          CTD_BUILD_RECEIPT_PATH: ${{ runner.temp }}/transportd-build-receipt.txt
+          CTD_RELEASE_RECEIPT_PATH: ${{ runner.temp }}/transportd-release-receipt.txt
+          CTD_RELEASE_ARTIFACT_PATH: ${{ runner.temp }}/transportd-release-image.tar
+          CTD_RELEASE_BINARY_PATH: ${{ runner.temp }}/codex-transportd
+          CTD_RELEASE_SBOM_PATH: ${{ runner.temp }}/transportd-release.cdx.json
+          CTD_RELEASE_LICENSE_REPORT_PATH: ${{ runner.temp }}/transportd-license-report.json
+        run: bash patches/transportd/tools/materialize-release-artifact.sh
+      - name: Verify release tag and exact materialized artifacts
+        env:
+          CTD_RELEASE_RECEIPT_PATH: ${{ runner.temp }}/transportd-release-receipt.txt
+          CTD_RELEASE_ARTIFACT_PATH: ${{ runner.temp }}/transportd-release-image.tar
+          CTD_RELEASE_BINARY_PATH: ${{ runner.temp }}/codex-transportd
+          CTD_RELEASE_SBOM_PATH: ${{ runner.temp }}/transportd-release.cdx.json
+          CTD_RELEASE_LICENSE_REPORT_PATH: ${{ runner.temp }}/transportd-license-report.json
+        run: bash patches/transportd/tools/release-tag-verify.sh

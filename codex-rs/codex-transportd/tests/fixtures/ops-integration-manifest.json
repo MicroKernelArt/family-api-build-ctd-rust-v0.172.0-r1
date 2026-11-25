@@ -1,0 +1,5 @@
+{
+  "role": "ops-contract-inventory",
+  "repo_relative_path": "feature/tls/contract/v1/requests/operations.json",
+  "expected_commit": "5d58f89beb996a6a0fbec0069bdd10043f51e820"
+}

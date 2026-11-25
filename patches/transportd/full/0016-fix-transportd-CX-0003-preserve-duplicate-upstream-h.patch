@@ -1,0 +1,62 @@
+From bc2c4bab775517350ec3c2844450920c858e555f Mon Sep 17 00:00:00 2001
+From: Shanks <shanks@book>
+Date: Wed, 9 Sep 2026 01:15:43 +0800
+Subject: [PATCH 16/37] fix(transportd): CX-0003 preserve duplicate upstream
+ headers
+
+(cherry picked from commit e495d8281c625b15cba497f0fd415851f32a6efd)
+---
+ codex-rs/codex-transportd/src/contract/mod.rs | 32 ++++++++++++++++++-
+ 1 file changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/codex-rs/codex-transportd/src/contract/mod.rs b/codex-rs/codex-transportd/src/contract/mod.rs
+index a46698407..a96ccf1b5 100644
+--- a/codex-rs/codex-transportd/src/contract/mod.rs
++++ b/codex-rs/codex-transportd/src/contract/mod.rs
+@@ -48,7 +48,7 @@ pub fn filter_upstream_headers(headers: &http::HeaderMap) -> http::HeaderMap {
+         if HOP_BY_HOP.contains(&name.as_str()) || name.as_str().starts_with("x-ctd-") {
+             continue;
+         }
+-        out.insert(name.clone(), value.clone());
++        out.append(name.clone(), value.clone());
+     }
+     out
+ }
+@@ -87,4 +87,34 @@ mod tests {
+         assert_eq!(filtered.get("content-type").unwrap(), "text/event-stream");
+         assert_eq!(filtered.get("x-request-id").unwrap(), "req_upstream");
+     }
++
++    #[test]
++    fn preserves_duplicate_end_to_end_headers() {
++        let mut headers = http::HeaderMap::new();
++        headers.append(
++            http::header::WWW_AUTHENTICATE,
++            "Bearer realm=\"primary\"".parse().unwrap(),
++        );
++        headers.append(
++            http::header::WWW_AUTHENTICATE,
++            "Basic realm=\"fallback\"".parse().unwrap(),
++        );
++        headers.insert(http::header::CONNECTION, "close".parse().unwrap());
++        headers.insert(http::header::SET_COOKIE, "session=secret".parse().unwrap());
++        headers.insert("x-ctd-origin", "forged".parse().unwrap());
++
++        let filtered = filter_upstream_headers(&headers);
++        let challenges = filtered
++            .get_all(http::header::WWW_AUTHENTICATE)
++            .iter()
++            .map(|value| value.to_str().unwrap())
++            .collect::<Vec<_>>();
++        assert_eq!(
++            challenges,
++            vec!["Bearer realm=\"primary\"", "Basic realm=\"fallback\""]
++        );
++        assert!(filtered.get(http::header::CONNECTION).is_none());
++        assert!(filtered.get(http::header::SET_COOKIE).is_none());
++        assert!(filtered.get("x-ctd-origin").is_none());
++    }
+ }
+-- 
+2.48.1
+

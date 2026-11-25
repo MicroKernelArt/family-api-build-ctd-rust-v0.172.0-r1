@@ -1,0 +1,479 @@
+From 735928903cf10b8d3207438ebac0523aee2aea5e Mon Sep 17 00:00:00 2001
+From: Shanks <shanks@book>
+Date: Fri, 2 Oct 2026 16:13:39 +0800
+Subject: [PATCH 34/37] fix(transportd): consume the carried account
+ installation-id as projection identity
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+R-CTD 的 installation 标识是 sidecar **进程级单值**
+（`bootstrap.rs::ensure_installation_id` → `ServerState.installation_id`），与上游
+账号无关；v1 `/responses` 出站 body 的
+`client_metadata["x-codex-installation-id"]` 由它注入 ⇒ **所有账号共用同一安装
+标识**（跨账号关联向量，up-1001/docs/07 §P2-1 C2 / docs/11 §2.3）。Go 侧已按上游
+账号派生该值（`resolveAccountInstallationID`），但交付前被 reserved 剥离，到不了
+sidecar——本提交是闭合该向量的 **Rust 半步**。
+
+- `contract/headers.rs`：`CARRIED_HEADER_NAMES` 增列
+  `x-codex-installation-id`（与 Go 侧 `codexCarriedHeaderNames` 仍**逐字相等**），
+  新增单一定义点常量 `CARRIED_INSTALLATION_ID_KEY`；改正历史注释里"由 sidecar 从
+  account_key 确定性派生"的错误陈述（该派生在代码里不存在）。
+- `transport/metadata.rs`：新增 `effective_installation_id(state_id, ctx)` ——
+  承载值优先、空值/空白回落进程级单值。`build_projection` 的入参语义收紧为
+  "必须是出站生效值"，由调用点解析一次。
+- `transport/{responses,compact,websocket}.rs`：三个调用点在构造投影前解析一次；
+  compact 的 installation 头与 projection 共用同一个值（头/体不再各自取值）。
+- `transport/responses.rs::outbound_headers`：把该头从合并表里**消费掉**——它是
+  projection 身份的**来源**，不是出站头；官方 `/responses` 不发该头（账号隔离由
+  body client_metadata 表达），不消费就会落进"未列名头按序追加"分支、凭空造出
+  R-Go 没有的头。
+
+边界（有意为之）：
+- v1 compact 的 installation 头照旧发出（官方 legacy compact 确实发该头），值从
+  进程级单值换成承载的账号值；
+- v3 通道不动：`/responses` 的 body 由 Go 拥有，compact 的头走
+  `V3_COMPACT_EXTRA_HEADER_NAMES`（既有实现），两条通道的头名集合在该头处重合，
+  契约由"两侧白名单逐字相等"承载。
+
+测试：`carried_installation_id_overrides_process_level_value`（承载优先 / 跨账号
+不同 / 空值回落 + 投影真的注入 body）、
+`carried_installation_id_is_consumed_and_never_emitted_on_v1_responses`（承载它
+不改变 v1 出站头集，逐字比对）、
+`compact_installation_header_follows_effective_carried_value`（compact 头/体同源
+且只有一份）、`carried_installation_id_is_accepted_by_the_v1_channel`；既有
+"非白名单头丢弃 / v3 白名单是 v1 超集 / compact 例外表不相交"三处断言按新契约
+更新（该头是唯一的**消费型**例外）。`cargo test -p codex-transportd --lib` 215 项
+全绿；`--features test-upstream` 下 wire 保真测试全绿（4 个 UDS 绑定类用例在基点
+提交上同样失败，属本机 UDS 路径长度环境问题，已 A/B 核实）。
+---
+ .../codex-transportd/src/contract/headers.rs  | 66 +++++++++++--
+ .../codex-transportd/src/transport/compact.rs | 52 ++++++++++
+ .../src/transport/metadata.rs                 | 96 +++++++++++++++++++
+ .../src/transport/responses.rs                | 54 ++++++++++-
+ .../src/transport/websocket.rs                |  5 +-
+ 5 files changed, 263 insertions(+), 10 deletions(-)
+
+diff --git a/codex-rs/codex-transportd/src/contract/headers.rs b/codex-rs/codex-transportd/src/contract/headers.rs
+index ce0c4fe4a..e1011050c 100644
+--- a/codex-rs/codex-transportd/src/contract/headers.rs
++++ b/codex-rs/codex-transportd/src/contract/headers.rs
+@@ -63,6 +63,11 @@ pub const CARRIED_HEADERS_HEADER: &str = "x-ctd-carried-headers";
+ /// upstream I/O 之前 fail closed。解析形态照抄 [`PROXY_KIND_HEADER`]。
+ pub const HOOKPOINT_HEADER: &str = "x-ctd-hookpoint";
+ 
++/// 承载通道交付的 installation 身份头名（**消费型**白名单项，见
++/// [`CARRIED_HEADER_NAMES`] 的说明）。单一定义点：白名单、projection 取值与
++/// v1 出站头集的消费点都引用它，避免第三处字面量漂移。
++pub const CARRIED_INSTALLATION_ID_KEY: &str = "x-codex-installation-id";
++
+ /// 允许承载到上游投影的官方 header 白名单（小写）。
+ /// 与 Go 侧 `codex_transport_integration.go` 的 `codexCarriedHeaderNames`
+ /// **逐字相等**；任何一侧增删都会让上游投影与 R-Go 直连发生漂移。
+@@ -70,8 +75,6 @@ pub const HOOKPOINT_HEADER: &str = "x-ctd-hookpoint";
+ /// 有意不纳入：
+ /// - `version`：跨语言契约显式禁止携带，且由官方 provider 的 version header
+ ///   （`CARGO_PKG_VERSION`）产出，承载它会让 sidecar 谎报自身构建版本；
+-/// - `x-codex-installation-id`：installation 身份由 sidecar 从 account_key
+-///   确定性派生；
+ /// - `x-codex-parent-thread-id` / `x-openai-subagent`：subagent 作用域，
+ ///   不在 R-Go 对拍范围。
+ ///
+@@ -83,6 +86,28 @@ pub const HOOKPOINT_HEADER: &str = "x-ctd-hookpoint";
+ /// `user-agent` / `originator` 纳入：R-Go 侧是网关归一化值，R-CTD 侧由官方
+ /// generator 在 sidecar 自身构建环境求值（os_info/arch/terminal、
+ /// `CODEX_INTERNAL_ORIGINATOR_OVERRIDE`），只有承载通道能对齐两者。
++///
++/// `x-codex-installation-id` 纳入（**消费型**，2026-10-02）：它的交付语义与
++/// 上表其余项**不同**——不是"投影覆盖/原样出站"，而是 projection 的
++/// `installation_id` **来源**（见 [`crate::transport::metadata::effective_installation_id`]）。
++///
++/// 原因：R-CTD 自身的 installation 身份是**进程级单值**
++/// （`bootstrap.rs::ensure_installation_id` → `ServerState.installation_id`），
++/// 与上游账号无关；而 v1 `/responses` 出站 body 的
++/// `client_metadata["x-codex-installation-id"]` 正是由它注入，Go 交付的账号值在
++/// 交付前被 reserved 剥离 ⇒ **所有账号共用同一安装标识**（跨账号关联向量）。
++/// Go 侧现已按上游账号派生该值（`resolveAccountInstallationID`），承载通道是它
++/// 到达 sidecar 的唯一途径。
++///
++/// ★ 该值**绝不出现在 v1 出站头集**：官方 `/responses` 不发这个头（账号隔离由
++/// body `client_metadata` 表达），发出会破坏已对齐的官方头构造序。见
++/// [`crate::transport::responses::outbound_headers`] 的消费点（`/responses`）与
++/// [`crate::transport::compact::compact_outbound_headers`] 的注入点（compact，
++/// 官方在那里确实发这个头）。
++///
++/// ★ 历史注释曾写「installation 身份由 sidecar 从 account_key 确定性派生」——
++/// **代码里不存在该派生**：`account_key` 只用于连接池 key
++/// （`transport/client_pool.rs`），实际来源始终是进程级单值。
+ pub const CARRIED_HEADER_NAMES: &[&str] = &[
+     "session-id",
+     "thread-id",
+@@ -95,6 +120,7 @@ pub const CARRIED_HEADER_NAMES: &[&str] = &[
+     "openai-beta",
+     "user-agent",
+     "originator",
++    CARRIED_INSTALLATION_ID_KEY,
+ ];
+ 
+ /// 凭据硬护栏：这些名字绝不进入上游投影，出现即 fail closed
+@@ -1124,11 +1150,10 @@ mod carried_header_tests {
+ 
+     #[test]
+     fn non_whitelisted_headers_are_dropped() {
+-        // x-codex-installation-id / version 不在白名单：前者由 sidecar 从 account_key
+-        // 派生，后者是官方 provider 自有，承载它们会造出 R-Go 没有的头。
++        // version 不在白名单：官方 provider 自有，承载它会造出 R-Go 没有的头。
+         // x-client-request-id 相反——它在白名单里（官方不变式 == session-id，
+         // R-Go 会发），必须被保留。
+-        let raw = r#"{"x-codex-installation-id":"inst-1","version":"0.159.0","x-client-request-id":"0198f2b0-0000-7000-8000-000000000001","x-codex-window-id":"0198f2b0-0000-7000-8000-000000000002:1"}"#;
++        let raw = r#"{"version":"0.159.0","x-client-request-id":"0198f2b0-0000-7000-8000-000000000001","x-codex-window-id":"0198f2b0-0000-7000-8000-000000000002:1"}"#;
+         let ctx = with_carried(raw).expect("parse");
+         assert_eq!(ctx.carried_headers.len(), 2);
+         assert_eq!(
+@@ -1136,7 +1161,6 @@ mod carried_header_tests {
+             Some("0198f2b0-0000-7000-8000-000000000002:1")
+         );
+         let outbound = ctx.carried_header_map();
+-        assert!(outbound.get("x-codex-installation-id").is_none());
+         assert!(outbound.get("version").is_none());
+         assert_eq!(
+             outbound.get("x-client-request-id").expect("carried"),
+@@ -1144,6 +1168,23 @@ mod carried_header_tests {
+         );
+     }
+ 
++    /// ★ `x-codex-installation-id` 是**消费型**白名单项：承载通道必须收下它
++    /// （见 [`crate::transport::metadata::effective_installation_id`]），与
++    /// `version` 这类"白名单外键"语义**相反**——后者解析期即被丢弃。
++    #[test]
++    fn carried_installation_id_is_accepted_by_the_v1_channel() {
++        let raw = r#"{"x-codex-installation-id":"0442ca22-065d-4351-bb85-aacd0b38faaf"}"#;
++        let ctx = with_carried(raw).expect("parse");
++        assert_eq!(
++            ctx.carried_headers
++                .get("x-codex-installation-id")
++                .map(String::as_str),
++            Some("0442ca22-065d-4351-bb85-aacd0b38faaf")
++        );
++        assert!(CARRIED_HEADER_NAMES.contains(&"x-codex-installation-id"));
++        assert_eq!(CARRIED_INSTALLATION_ID_KEY, "x-codex-installation-id");
++    }
++
+     #[test]
+     fn malformed_carrier_is_contract_error() {
+         for raw in ["not-json", "[]", r#"{"x-client-request-id":1}"#] {
+@@ -1372,13 +1413,22 @@ mod v3_outbound_header_tests {
+         for name in V3_AUDIT_HEADERS {
+             assert!(V3_HEADER_ALLOWLIST.contains(name), "{name} 必须在白名单内");
+         }
+-        // v3 白名单 ⊇ v1 承载白名单（v3 是全集，v1 是子集），唯一例外是
+-        // openai-beta（官方 HTTP POST 不发；R-Go 的 HTTP 策略同样剥离）。
++        // v3 白名单 ⊇ v1 承载白名单（v3 是全集，v1 是子集），两个例外：
++        //  - `openai-beta`：官方 HTTP POST 不发（R-Go 的 HTTP 策略同样剥离）；
++        //  - `x-codex-installation-id`：官方 `/responses` **不作为头**发（账号隔离
++        //    由 body `client_metadata` 表达）⇒ 它不在 `/responses` 的 18 头表里，
++        //    只在 compact 下经 [`V3_COMPACT_EXTRA_HEADER_NAMES`] 放行；v1 侧则是
++        //    承载通道的**消费型**项（projection 的 installation_id 来源）。
+         for name in CARRIED_HEADER_NAMES {
+             if *name == "openai-beta" {
+                 assert!(!V3_HEADER_ALLOWLIST.contains(name));
+                 continue;
+             }
++            if *name == CARRIED_INSTALLATION_ID_KEY {
++                assert!(!V3_HEADER_ALLOWLIST.contains(name));
++                assert!(V3_COMPACT_EXTRA_HEADER_NAMES.contains(name));
++                continue;
++            }
+             assert!(
+                 V3_HEADER_ALLOWLIST.contains(name),
+                 "v1 承载的 {name} 必须仍被 v3 承载"
+diff --git a/codex-rs/codex-transportd/src/transport/compact.rs b/codex-rs/codex-transportd/src/transport/compact.rs
+index 66f16256f..6c2bc9a59 100644
+--- a/codex-rs/codex-transportd/src/transport/compact.rs
++++ b/codex-rs/codex-transportd/src/transport/compact.rs
+@@ -107,6 +107,10 @@ pub async fn execute_compact_raw(
+             "compact requires a session snapshot",
+         )
+     })?;
++    // installation 身份 = 出站生效值（承载通道优先 ⇒ Go 按上游账号派生的值；
++    // 否则回落 sidecar 进程级单值）。**一次解析**，projection 与 installation 头
++    // 共用同一个值（头/体不得各自取值）。
++    let installation_id = metadata::effective_installation_id(installation_id, ctx);
+     let projection = metadata::build_projection(installation_id, session)?;
+ 
+     // 出站头：与 responses **同一权威**（`responses::outbound_headers()` 的
+@@ -314,6 +318,54 @@ mod tests {
+         assert_eq!(trailing["originator"], "codex-tui");
+     }
+ 
++    /// ★ 安装标识的**生效值**闭环（v1 compact 腿）：承载的账号安装标识（Go
++    /// `resolveAccountInstallationID`）覆盖 sidecar 进程级单值，且**只有一份**
++    /// ——承载项被 `responses::outbound_headers` 消费掉，不会与注入的
++    /// installation 头重复（compact 官方确实发该头）。
++    #[test]
++    fn compact_installation_header_follows_effective_carried_value() {
++        let account_id = "0442ca22-065d-4351-bb85-aacd0b38faaf";
++        let mut ctx = ctx_fixture();
++        ctx.carried_headers.insert(
++            crate::contract::headers::CARRIED_INSTALLATION_ID_KEY.to_string(),
++            account_id.to_string(),
++        );
++        let effective = metadata::effective_installation_id("state-installation", &ctx);
++        assert_eq!(effective, account_id);
++        let projection = metadata::build_projection(
++            effective,
++            ctx.session.as_ref().expect("session snapshot"),
++        )
++        .expect("projection");
++        let (headers, _) = compact_outbound_headers(&ctx, effective, &projection);
++        assert_eq!(headers["x-codex-installation-id"], account_id);
++        assert_eq!(headers.get_all("x-codex-installation-id").iter().count(), 1);
++        // body 侧同一份值（头/体不得各自取值）。
++        assert_eq!(
++            projection
++                .client_metadata(false)
++                .get("x-codex-installation-id")
++                .map(String::as_str),
++            Some(account_id)
++        );
++
++        // 不承载 ⇒ 回落进程级单值，且头集形态逐字相同（只换值）。
++        let bare = ctx_fixture();
++        let fallback = metadata::effective_installation_id("state-installation", &bare);
++        assert_eq!(fallback, "state-installation");
++        let projection = metadata::build_projection(
++            fallback,
++            bare.session.as_ref().expect("session snapshot"),
++        )
++        .expect("projection");
++        let (baseline_headers, _) = compact_outbound_headers(&bare, fallback, &projection);
++        assert_eq!(baseline_headers["x-codex-installation-id"], "state-installation");
++        assert_eq!(baseline_headers.get_all("x-codex-installation-id").iter().count(), 1);
++        let names: Vec<&str> = baseline_headers.keys().map(http::HeaderName::as_str).collect();
++        let carried_names: Vec<&str> = headers.keys().map(http::HeaderName::as_str).collect();
++        assert_eq!(names, carried_names);
++    }
++
+     #[test]
+     fn compact_timeout_is_bounded() {
+         assert_eq!(COMPACT_REQUEST_TIMEOUT, Duration::from_secs(1200));
+diff --git a/codex-rs/codex-transportd/src/transport/metadata.rs b/codex-rs/codex-transportd/src/transport/metadata.rs
+index cf866d618..d43b3e853 100644
+--- a/codex-rs/codex-transportd/src/transport/metadata.rs
++++ b/codex-rs/codex-transportd/src/transport/metadata.rs
+@@ -339,7 +339,39 @@ pub fn rewrite_prompt_cache_key(obj: &mut Map<String, Value>, outbound_session_i
+     }
+ }
+ 
++/// 出站生效的 installation 标识：**承载通道优先**，否则回落到进程级单值。
++///
++/// - 承载值 = Go 侧按**上游账号**派生的安装标识（`resolveAccountInstallationID`：
++///   账号持久 device_id，否则按账号身份 namespace 确定性派生）⇒ 同一账号恒定、
++///   不同账号不同；
++/// - 回落值 = `ServerState.installation_id`（sidecar 启动时从
++///   `CODEX_HOME/installation_id` 解析的**进程级单值**，与上游账号无关）。
++///
++/// ★ 为什么必须在此处消费：v1 `/responses` 出站 body 的
++/// `client_metadata["x-codex-installation-id"]` 由 projection 注入，而 projection
++/// 过去只拿得到进程级单值 ⇒ 所有账号共用同一安装标识（跨账号关联向量）。承载
++/// 通道是该值到达 sidecar 的唯一途径（其余来源在 Go 侧 reserved 剥离时已被删）。
++///
++/// 空值/空白值不构成覆盖（与承载通道"空值不承载"同语义）；无效值不做格式校验
++/// ——installation 是**不透明**设备标识，官方客户端发的也是不透明值，形状校验
++/// 只会把上游不关心的差异变成 fail closed。
++pub fn effective_installation_id<'a>(
++    state_installation_id: &'a str,
++    ctx: &'a crate::contract::RequestContext,
++) -> &'a str {
++    ctx.carried_headers
++        .get(crate::contract::headers::CARRIED_INSTALLATION_ID_KEY)
++        .map(String::as_str)
++        .map(str::trim)
++        .filter(|value| !value.is_empty())
++        .unwrap_or(state_installation_id)
++}
++
+ /// 构造官方 metadata 投影（UUIDv7 校验在入口完成）。
++///
++/// `installation_id` 必须是**出站生效值**（承载优先），由调用点在进入本函数前用
++/// [`effective_installation_id`] 解析一次；本函数不再自行回落，避免出现第二个
++/// 判定点。
+ pub fn build_projection(
+     installation_id: &str,
+     session: &SessionSnapshot,
+@@ -389,6 +421,70 @@ pub fn big_int_roundtrip_safe(body: &Value) -> bool {
+ mod tests {
+     use super::*;
+     use serde_json::json;
++    use std::collections::BTreeMap;
++
++    /// ★ 安装标识的**账号隔离**闭环：承载通道（Go 按上游账号派生
++    /// `resolveAccountInstallationID`）优先于 sidecar 进程级单值，且投影真的把它
++    /// 注入 body `client_metadata`；缺失/空白值 ⇒ 回落进程级单值（旧行为不变）。
++    #[test]
++    fn carried_installation_id_overrides_process_level_value() {
++        let state_id = "471d380a-b8b9-40f9-9d49-ff282b17a6b9";
++        let account_a = "0442ca22-065d-4351-bb85-aacd0b38faaf";
++        let account_b = "0f3d1c76-9d1e-4f2a-8b31-5c7de2f41a90";
++        let session = || SessionSnapshot {
++            session_id: "0198f2b0-0000-7000-8000-000000000001".to_string(),
++            thread_id: "0198f2b0-0000-7000-8000-000000000002".to_string(),
++            window_id: "0198f2b0-0000-7000-8000-000000000002:1".to_string(),
++        };
++        let with_carried = |value: &str| crate::contract::RequestContext {
++            session: Some(session()),
++            carried_headers: BTreeMap::from([(
++                crate::contract::headers::CARRIED_INSTALLATION_ID_KEY.to_string(),
++                value.to_string(),
++            )]),
++            ..Default::default()
++        };
++
++        // ① 承载有值 ⇒ 承载获胜，且投影把它注入 body client_metadata
++        //    （v1 `/responses` 的安装标识就是这一位）。
++        let ctx = with_carried(account_a);
++        assert_eq!(effective_installation_id(state_id, &ctx), account_a);
++        let projection =
++            build_projection(effective_installation_id(state_id, &ctx), &session()).expect("projection");
++        assert_eq!(
++            projection
++                .client_metadata(false)
++                .get("x-codex-installation-id")
++                .map(String::as_str),
++            Some(account_a)
++        );
++
++        // ② 跨账号不同 ⇒ 投影值不同（这正是闭合掉的关联向量）。
++        let ctx_b = with_carried(account_b);
++        assert_eq!(effective_installation_id(state_id, &ctx_b), account_b);
++        assert_ne!(
++            build_projection(effective_installation_id(state_id, &ctx), &session())
++                .expect("projection")
++                .client_metadata(false),
++            build_projection(effective_installation_id(state_id, &ctx_b), &session())
++                .expect("projection")
++                .client_metadata(false)
++        );
++
++        // ③ 不承载 / 空值 / 纯空白 ⇒ 进程级单值（旧行为逐字不变）。
++        let bare = crate::contract::RequestContext {
++            session: Some(session()),
++            ..Default::default()
++        };
++        assert_eq!(effective_installation_id(state_id, &bare), state_id);
++        for blank in ["", "   "] {
++            assert_eq!(
++                effective_installation_id(state_id, &with_carried(blank)),
++                state_id,
++                "空值 {blank:?} 不构成覆盖"
++            );
++        }
++    }
+ 
+     #[test]
+     fn reserved_root_key_fails_closed() {
+diff --git a/codex-rs/codex-transportd/src/transport/responses.rs b/codex-rs/codex-transportd/src/transport/responses.rs
+index b24950361..aafc67026 100644
+--- a/codex-rs/codex-transportd/src/transport/responses.rs
++++ b/codex-rs/codex-transportd/src/transport/responses.rs
+@@ -101,6 +101,15 @@ pub const V1_TRAILING_HEADER_ORDER: &[&str] = &["originator", "user-agent"];
+ ///
+ /// 未列入两张表的头（如 `openai-beta`）按**确定性键序**追加在自派生段之后——
+ /// 官方 HTTP POST 不发这些头（`docs/20 §3.2`），此处只保证「不丢、不乱序」。
++///
++/// ★ 唯一的**消费型**白名单项是 `x-codex-installation-id`
++/// （[`crate::contract::headers::CARRIED_INSTALLATION_ID_KEY`]）：它承载的是
++/// projection 的 `installation_id` **来源**（见
++/// [`metadata::effective_installation_id`]），不是出站头——官方 `/responses`
++/// 不发该头（账号隔离由 body `client_metadata` 表达）。因此这里显式消费掉，
++/// 绝不让它落进"未列名头按序追加"的分支。compact 侧的 installation 头由
++/// [`crate::transport::compact::compact_outbound_headers`] 单独注入（官方 legacy
++/// compact 确实发这个头）。
+ pub fn outbound_headers(
+     ctx: &RequestContext,
+     projection: &codex_core::CodexResponsesMetadata,
+@@ -115,6 +124,7 @@ pub fn outbound_headers(
+             merged.insert(name.as_str().to_string(), value.clone());
+         }
+     }
++    merged.remove(crate::contract::headers::CARRIED_INSTALLATION_ID_KEY);
+ 
+     let mut headers = HeaderMap::new();
+     for name in V1_METADATA_HEADER_ORDER {
+@@ -191,7 +201,10 @@ pub async fn execute_responses_raw(
+             "responses requires a session snapshot",
+         )
+     })?;
+-    let projection = metadata::build_projection(installation_id, session)?;
++    let projection = metadata::build_projection(
++        metadata::effective_installation_id(installation_id, ctx),
++        session,
++    )?;
+     // F12（review）：直接拿所有权，消灭整树深拷贝（value 之后不再使用）。
+     let serde_json::Value::Object(mut obj) = value else {
+         return Err(LocalError::new(
+@@ -509,6 +522,45 @@ mod tests {
+         assert_eq!(observed.last().copied(), Some("openai-beta"));
+     }
+ 
++    /// ★ 消费型白名单项（`x-codex-installation-id`）的 v1 行为：
++    /// 承载它**不得**改变 v1 `/responses` 的出站头集——它是 projection 的
++    /// `installation_id` 来源，官方 `/responses` 不发这个头。
++    ///
++    /// 断言口径是"逐字不变"：同一 ctx 加上/不加该承载项，头名序列与尾段完全相同，
++    /// 且两侧都**没有**该头。
++    #[test]
++    fn carried_installation_id_is_consumed_and_never_emitted_on_v1_responses() {
++        let baseline = crate::contract::RequestContext {
++            session: Some(crate::contract::headers::SessionSnapshot {
++                session_id: "0198f2b0-0000-7000-8000-000000000001".to_string(),
++                thread_id: "0198f2b0-0000-7000-8000-000000000002".to_string(),
++                window_id: "0198f2b0-0000-7000-8000-000000000002:1".to_string(),
++            }),
++            carried_headers: carried_fixture(),
++            ..Default::default()
++        };
++        let mut with_installation = baseline.clone();
++        with_installation.carried_headers.insert(
++            crate::contract::headers::CARRIED_INSTALLATION_ID_KEY.to_string(),
++            "0442ca22-065d-4351-bb85-aacd0b38faaf".to_string(),
++        );
++
++        let (before, before_trailing) = outbound_headers(&baseline, &projection());
++        let (after, after_trailing) = outbound_headers(&with_installation, &projection());
++
++        let names = |map: &http::HeaderMap| -> Vec<String> {
++            map.keys().map(|name| name.as_str().to_string()).collect()
++        };
++        assert_eq!(names(&before), names(&after), "承载安装标识不得改变 v1 出站头集");
++        assert_eq!(
++            names(&before_trailing),
++            names(&after_trailing),
++            "承载安装标识不得改变尾段头集"
++        );
++        assert!(after.get("x-codex-installation-id").is_none());
++        assert!(after_trailing.get("x-codex-installation-id").is_none());
++    }
++
+     #[test]
+     fn carried_values_override_local_projection() {
+         // 承载通道是 FR-004 的唯一 header 通道：同名键覆盖本地派生值。
+diff --git a/codex-rs/codex-transportd/src/transport/websocket.rs b/codex-rs/codex-transportd/src/transport/websocket.rs
+index c68c63919..ff12e85d7 100644
+--- a/codex-rs/codex-transportd/src/transport/websocket.rs
++++ b/codex-rs/codex-transportd/src/transport/websocket.rs
+@@ -82,7 +82,10 @@ pub async fn connect_responses_ws_v2(
+             "responses WS requires a session snapshot",
+         )
+     })?;
+-    let projection = metadata::build_projection(installation_id, session)?;
++    let projection = metadata::build_projection(
++        metadata::effective_installation_id(installation_id, ctx),
++        session,
++    )?;
+ 
+     let handle = official_adapter::resolve_route_handle(ctx.proxy_kind, ctx.proxy_url.as_ref())?;
+     let official_route = crate::transport::proxy::to_official_route(&handle.route);
+-- 
+2.48.1
+
