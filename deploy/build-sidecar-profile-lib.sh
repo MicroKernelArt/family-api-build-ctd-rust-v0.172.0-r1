@@ -2,7 +2,7 @@
 # Build profile contract shared by the sidecar entrypoint and its tests.
 # shellcheck disable=SC2034 # Values are exported to scripts that source this library.
 
-RUST_IMAGE="rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1"
+RUST_IMAGE="rust:1.99.1-bookworm@sha256:4715c3ad743951a3cea90e8b432f2a17e0ef5f3f3c3abf75108879e783b396f0"
 DEBIAN_IMAGE="debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258"
 
 ctd_configure_build_profile() {
