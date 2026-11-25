@@ -1,0 +1,268 @@
+From 34cc8d25b44384e8c034010cd3611b34657f0ca1 Mon Sep 17 00:00:00 2001
+From: Shanks <shanks@book>
+Date: Thu, 1 Oct 2026 18:18:16 +0800
+Subject: [PATCH 23/37] replay0905-v0159.2: re-pin upstream identity to
+ rust-v0.159.2
+
+Baseline identity bump (UPSTREAM_UPGRADE.md checklist item 1) so the
+tree no longer declares a base it is not built from. The Go-side
+readiness gate cross-checks codex_tag / codex_commit /
+cargo_lock_sha256 from /info, so a stale constant here is a live
+correctness bug, not a doc nit.
+
+  tag          rust-v0.159.0 -> rust-v0.159.2
+  tag object   377f7f557a6bdea0f3a2d26d4d899c66db4789d0 -> 8b9fa496bbf2c47aebd62e85a080b9a522a455b5
+  commit       687a119f0fcaace47e1f1abcc77cec6c813fd6da -> ff6aec96948b70d94983af2641a6b67c94faeff5
+  base tree    bee1375c8502e4c4d71db017f7e087dfbb3e775c -> 406dfdd5c68f303a3a8d04f32b3965b3b0ca0361
+  Cargo.lock   16b915e94730a7e598182620923fc6eae19e32366d3b5ef91128002575ae24af
+               -> 4fab6fe99180e2b8f305bd4b33c1b4bd825e3fa4cdef1045be750843bd3d431e
+
+MODULE.bazel.lock and the v8 pin (150.4.0) are byte-identical between
+the two bases, so those digests are unchanged.
+
+Also bumps the version-derived golden fixture: the operation snapshot
+generator string is env!("CARGO_PKG_VERSION"), which follows the
+workspace version, so tests/fixtures/operations_snapshot.golden.json
+must move to v0.159.2 with it.
+---
+ SBOM.md                                       |  6 ++---
+ UPSTREAM_BASE.md                              | 27 ++++++++++++-------
+ WIRE_COMPATIBILITY.md                         | 14 +++++-----
+ codex-rs/codex-transportd/BUILD_PROOF.md      |  6 ++---
+ codex-rs/codex-transportd/Cargo.toml          |  2 +-
+ codex-rs/codex-transportd/Dockerfile          |  2 +-
+ codex-rs/codex-transportd/src/build_info.rs   | 12 ++++-----
+ codex-rs/codex-transportd/src/main.rs         |  2 +-
+ .../fixtures/operations_snapshot.golden.json  |  2 +-
+ docs/REPLAY0905_SQUASH_MAP.md                 |  4 +--
+ 10 files changed, 42 insertions(+), 35 deletions(-)
+
+diff --git a/SBOM.md b/SBOM.md
+index 6c6c9f2a4..6b72b9967 100644
+--- a/SBOM.md
++++ b/SBOM.md
+@@ -5,9 +5,9 @@
+ | 输入 | 值 | 证据 |
+ |---|---|---|
+ | upstream repo | `https://github.com/openai/codex` | UPSTREAM_BASE.md |
+-| upstream tag | `rust-v0.159.0` | `git ls-remote refs/tags/rust-v0.159.0^{}` |
+-| upstream commit | `687a119f0fcaace47e1f1abcc77cec6c813fd6da` | 同上 |
+-| upstream Cargo.lock SHA-256 | `16b915e94730a7e598182620923fc6eae19e32366d3b5ef91128002575ae24af` | `shasum -a 256` |
++| upstream tag | `rust-v0.159.2` | `git ls-remote refs/tags/rust-v0.159.2^{}` |
++| upstream commit | `ff6aec96948b70d94983af2641a6b67c94faeff5` | 同上 |
++| upstream Cargo.lock SHA-256 | `4fab6fe99180e2b8f305bd4b33c1b4bd825e3fa4cdef1045be750843bd3d431e` | `shasum -a 256` |
+ | fork branch | （不声明：不存在该名字的分支；实际构建 ref 见 receipt 的 review_commit） | — |
+ | fork commit | `（构建时由 build.rs 注入，见 /info fork_commit）`（构建时自动注入，/info fork_commit 一致） | git + build.rs |
+ | fork Cargo.lock SHA-256 | `（构建时由 build.rs 计算，见 /info fork_cargo_lock_sha256）`（构建时自动计算，/info fork_cargo_lock_sha256 一致） | build.rs sha2 |
+diff --git a/UPSTREAM_BASE.md b/UPSTREAM_BASE.md
+index d10d153c9..7d4d36070 100644
+--- a/UPSTREAM_BASE.md
++++ b/UPSTREAM_BASE.md
+@@ -1,27 +1,34 @@
+ # UPSTREAM_BASE
+ 
+ The replay0905 source line is based on the immutable OpenAI Codex
+-`rust-v0.159.0` release object.
++`rust-v0.159.2` release object.
+ 
+ | Field | Value |
+ |---|---|
+ | upstream repository | `https://github.com/openai/codex` |
+-| annotated tag | `rust-v0.159.0` |
+-| tag object | `377f7f557a6bdea0f3a2d26d4d899c66db4789d0` |
+-| peeled base commit | `687a119f0fcaace47e1f1abcc77cec6c813fd6da` |
+-| base tree | `bee1375c8502e4c4d71db017f7e087dfbb3e775c` |
+-| base `codex-rs/Cargo.lock` SHA-256 | `16b915e94730a7e598182620923fc6eae19e32366d3b5ef91128002575ae24af` |
++| annotated tag | `rust-v0.159.2` |
++| tag object | `8b9fa496bbf2c47aebd62e85a080b9a522a455b5` |
++| peeled base commit | `ff6aec96948b70d94983af2641a6b67c94faeff5` |
++| base tree | `406dfdd5c68f303a3a8d04f32b3965b3b0ca0361` |
++| base `codex-rs/Cargo.lock` SHA-256 | `4fab6fe99180e2b8f305bd4b33c1b4bd825e3fa4cdef1045be750843bd3d431e` |
+ | base `MODULE.bazel.lock` SHA-256 | `be65892b2bdb12c0867dabfcaaf7ca4ee7a9ae4915e0d0de9c99448158777d31` |
+ | Rust toolchain | `1.95.0` |
+ | license | Apache-2.0 |
+ 
++Previous base in this line: `rust-v0.159.0` (`687a119f0fcaace47e1f1abcc77cec6c813fd6da`,
++tree `bee1375c8502e4c4d71db017f7e087dfbb3e775c`, lock
++`16b915e94730a7e598182620923fc6eae19e32366d3b5ef91128002575ae24af`). It was
++superseded because the Go-side sub2api implementation tracks `rust-v0.159.2`.
++`MODULE.bazel.lock` and the `v8` pin (`v8 150.4.0`) are byte-identical across
++both bases.
++
+ Verification uses the objects already shipped by this repository:
+ 
+ ```bash
+-git cat-file -p 377f7f557a6bdea0f3a2d26d4d899c66db4789d0
+-git rev-parse '377f7f557a6bdea0f3a2d26d4d899c66db4789d0^{}'
+-git show 687a119f0fcaace47e1f1abcc77cec6c813fd6da:codex-rs/Cargo.lock | shasum -a 256
+-git show 687a119f0fcaace47e1f1abcc77cec6c813fd6da:MODULE.bazel.lock | shasum -a 256
++git cat-file -p 8b9fa496bbf2c47aebd62e85a080b9a522a455b5
++git rev-parse '8b9fa496bbf2c47aebd62e85a080b9a522a455b5^{}'
++git show ff6aec96948b70d94983af2641a6b67c94faeff5:codex-rs/Cargo.lock | shasum -a 256
++git show ff6aec96948b70d94983af2641a6b67c94faeff5:MODULE.bazel.lock | shasum -a 256
+ ```
+ 
+ Changing any base identity requires regenerating the complete patch series and
+diff --git a/WIRE_COMPATIBILITY.md b/WIRE_COMPATIBILITY.md
+index f4e382088..986ca59b6 100644
+--- a/WIRE_COMPATIBILITY.md
++++ b/WIRE_COMPATIBILITY.md
+@@ -1,19 +1,19 @@
+ # WIRE_COMPATIBILITY（T-010 / TLS-CTD-001 §18.5）
+ 
+-官方原版 `rust-v0.159.0` 与 sidecar candidate 的线级对照报告。本文档与
++官方原版 `rust-v0.159.2` 与 sidecar candidate 的线级对照报告。本文档与
+ `/info`（`build_info.rs`）、`PATCHES.md`、SBOM 共同构成 wire gate 证据链。
+ 
+ > **范围说明**：下表的对照是 **rust-v0.144.1 时代**（T-010）做的，尚未对当前
+-> rust-v0.159.0 基线重跑；因此 `wire_status` 记 `unverified`，release 模式的
++> rust-v0.159.2 基线重跑；因此 `wire_status` 记 `unverified`，release 模式的
+ > wire gate 会据此拒绝。本文件描述的是 candidate，但其中的测量数据属于上一代基线。
+ 
+ ## 基线
+ 
+ | 项 | 值 |
+ |---|---|
+-| 官方 tag | `rust-v0.159.0` |
+-| 官方 commit | `687a119f0fcaace47e1f1abcc77cec6c813fd6da` |
+-| 官方 lock SHA-256 | `16b915e94730a7e598182620923fc6eae19e32366d3b5ef91128002575ae24af` |
++| 官方 tag | `rust-v0.159.2` |
++| 官方 commit | `ff6aec96948b70d94983af2641a6b67c94faeff5` |
++| 官方 lock SHA-256 | `4fab6fe99180e2b8f305bd4b33c1b4bd825e3fa4cdef1045be750843bd3d431e` |
+ | toolchain | `1.95.0` |
+ | target | `x86_64-unknown-linux-gnu`（ion2 linux/amd64） |
+ | reference runner | clean official build（同 lock/toolchain/image） |
+@@ -64,7 +64,7 @@ source commit → Cargo.lock → SBOM → image digest（/info + readiness 校
+ 
+ ## 状态快照（2026-08-05）
+ 
+-- **reference**: 官方 release binary（`rust-v0.159.0`，由 release 流程产出）
++- **reference**: 官方 release binary（`rust-v0.159.2`，由 release 流程产出）
+ - **candidate**: 本 fork HEAD `（构建时由 build.rs 注入，见 /info fork_commit）`（build.rs 自动注入 fork commit + lock hash，
+   `/info` 与 SBOM 一致；binary digest 由 CI 构建后注入 `CODEX_TRANSPORTD_BUILD_PROOF_DIGEST`）
+ - **wire comparison / canary gate: OPEN**——本地 e2e（fake upstream）证明
+@@ -76,6 +76,6 @@ source commit → Cargo.lock → SBOM → image digest（/info + readiness 校
+ 
+ wire_source_commit: 05289a36b7d2dc0db62fe1d8fa0bb94a4abc5f84
+ wire_source_tree: 972b1ac3a5be0b3b9fd49b6f383feab990b5beab
+-# unverified：0.144.1 时代的线级对照（T-010）尚未对 rust-v0.159.0 基线重跑。
++# unverified：0.144.1 时代的线级对照（T-010）尚未对 rust-v0.159.2 基线重跑。
+ # 非 release 模式下 wire-gate.sh 接受 unverified；release 模式要求 pass。
+ wire_status: unverified
+diff --git a/codex-rs/codex-transportd/BUILD_PROOF.md b/codex-rs/codex-transportd/BUILD_PROOF.md
+index eb2d230a2..3654ced50 100644
+--- a/codex-rs/codex-transportd/BUILD_PROOF.md
++++ b/codex-rs/codex-transportd/BUILD_PROOF.md
+@@ -3,10 +3,10 @@
+ > 本文件是 **build-proof**，不是最终 release candidate。HTTP candidate
+ > （T-005）与最终 release candidate（T-010）digest 另行记录。
+ 
+-## 冻结输入（当前基线：rust-v0.159.0）
++## 冻结输入（当前基线：rust-v0.159.2）
+ 
+-- upstream commit：`687a119f0fcaace47e1f1abcc77cec6c813fd6da`
+-- upstream `codex-rs/Cargo.lock` SHA-256：`16b915e94730a7e598182620923fc6eae19e32366d3b5ef91128002575ae24af`
++- upstream commit：`ff6aec96948b70d94983af2641a6b67c94faeff5`
++- upstream `codex-rs/Cargo.lock` SHA-256：`4fab6fe99180e2b8f305bd4b33c1b4bd825e3fa4cdef1045be750843bd3d431e`
+ - toolchain：`1.95.0`
+ - base image（production/reference 相同 digest，Q-02 冻结）：
+   `debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258`
+diff --git a/codex-rs/codex-transportd/Cargo.toml b/codex-rs/codex-transportd/Cargo.toml
+index fdc9c9833..1e053ca70 100644
+--- a/codex-rs/codex-transportd/Cargo.toml
++++ b/codex-rs/codex-transportd/Cargo.toml
+@@ -5,7 +5,7 @@ rust-version = "1.89"
+ version.workspace = true
+ edition.workspace = true
+ license.workspace = true
+-description = "Codex transport sidecar: UDS-only closed operations over the official rust-v0.159.0 transport"
++description = "Codex transport sidecar: UDS-only closed operations over the official rust-v0.159.2 transport"
+ publish = false
+ 
+ [features]
+diff --git a/codex-rs/codex-transportd/Dockerfile b/codex-rs/codex-transportd/Dockerfile
+index 04eaa1930..a73b382b2 100644
+--- a/codex-rs/codex-transportd/Dockerfile
++++ b/codex-rs/codex-transportd/Dockerfile
+@@ -19,7 +19,7 @@ WORKDIR /src/codex-rs
+ # R8-F1：RELEASE_ID 经 build-arg 注入（build.rs option_env! 编译期读取）。
+ # 缺省值刻意取 *-dev：不经 build-arg 直接构建时，产出的就是 dev 镜像；
+ # 正式构建由 profile 层强制传入 series.yaml 的 release_id（不一致即拒绝）。
+-ARG RELEASE_ID=ctd-rust-v0.159.0-dev
++ARG RELEASE_ID=ctd-rust-v0.159.2-dev
+ ENV CODEX_TRANSPORTD_RELEASE_ID=$RELEASE_ID
+ RUN --mount=type=bind,source=.,target=/src,readonly \
+     --mount=type=cache,target=/src/codex-rs/target \
+diff --git a/codex-rs/codex-transportd/src/build_info.rs b/codex-rs/codex-transportd/src/build_info.rs
+index e4637d8ba..6d2cedbe6 100644
+--- a/codex-rs/codex-transportd/src/build_info.rs
++++ b/codex-rs/codex-transportd/src/build_info.rs
+@@ -8,20 +8,20 @@
+ /// 构建流水线可覆盖为正式 ID，缺省为 dev）。
+ pub const RELEASE_ID: &str = match option_env!("CODEX_TRANSPORTD_RELEASE_ID") {
+     Some(value) => value,
+-    None => "ctd-rust-v0.159.0-dev",
++    None => "ctd-rust-v0.159.2-dev",
+ };
+ 
+ /// Upstream tag（官方 exact-tag fork 基准）。
+-pub const UPSTREAM_TAG: &str = "rust-v0.159.0";
++pub const UPSTREAM_TAG: &str = "rust-v0.159.2";
+ 
+-/// Upstream peeled commit（`git ls-remote refs/tags/rust-v0.159.0^{}`）。
+-/// 377f7f55 是 annotated tag 对象；peeled source commit 才是 687a119f……
++/// Upstream peeled commit（`git ls-remote refs/tags/rust-v0.159.2^{}`）。
++/// 8b9fa496 是 annotated tag 对象；peeled source commit 才是 ff6aec96……
+ /// （real-lane codexp RF1）。与 Go 侧 /info pin 一致使用 peeled commit。
+-pub const UPSTREAM_COMMIT: &str = "687a119f0fcaace47e1f1abcc77cec6c813fd6da";
++pub const UPSTREAM_COMMIT: &str = "ff6aec96948b70d94983af2641a6b67c94faeff5";
+ 
+ /// Upstream `codex-rs/Cargo.lock` SHA-256（fork 之前官方锁文件）。
+ pub const UPSTREAM_LOCK_SHA256: &str =
+-    "16b915e94730a7e598182620923fc6eae19e32366d3b5ef91128002575ae24af";
++    "4fab6fe99180e2b8f305bd4b33c1b4bd825e3fa4cdef1045be750843bd3d431e";
+ 
+ /// Rust toolchain（`codex-rs/rust-toolchain.toml`）。
+ pub const TOOLCHAIN: &str = "1.95.0";
+diff --git a/codex-rs/codex-transportd/src/main.rs b/codex-rs/codex-transportd/src/main.rs
+index b357021fb..bbf505a09 100644
+--- a/codex-rs/codex-transportd/src/main.rs
++++ b/codex-rs/codex-transportd/src/main.rs
+@@ -1,6 +1,6 @@
+ //! codex-transportd：Codex transport sidecar（TLS-CTD-001）。
+ //!
+-//! UDS-only 封闭 operation server，基于官方 rust-v0.159.0 transport。
++//! UDS-only 封闭 operation server，基于官方 rust-v0.159.2 transport。
+ 
+ use std::process::ExitCode;
+ 
+diff --git a/codex-rs/codex-transportd/tests/fixtures/operations_snapshot.golden.json b/codex-rs/codex-transportd/tests/fixtures/operations_snapshot.golden.json
+index 47d469cae..38f40a67c 100644
+--- a/codex-rs/codex-transportd/tests/fixtures/operations_snapshot.golden.json
++++ b/codex-rs/codex-transportd/tests/fixtures/operations_snapshot.golden.json
+@@ -1,6 +1,6 @@
+ {
+   "snapshot_version": 1,
+-  "generator": "codex-transportd v0.159.0",
++  "generator": "codex-transportd v0.159.2",
+   "operation_count": 17,
+   "operations": [
+     {
+diff --git a/docs/REPLAY0905_SQUASH_MAP.md b/docs/REPLAY0905_SQUASH_MAP.md
+index 4946a3fd0..11b6b2df7 100644
+--- a/docs/REPLAY0905_SQUASH_MAP.md
++++ b/docs/REPLAY0905_SQUASH_MAP.md
+@@ -2,8 +2,8 @@
+ 
+ > **历史记录 / 已被取代（superseded）**：本文件是 2026-09-06 的 `replay0905` review
+ > 压缩记录，基线 `042fb41b`（rust-v0.153.4），其中「Phase C 0.153.4 API drift」等内容
+-> 属于该基线。本线已由 `replay0905-v0159-r1` 取代（基线 rust-v0.159.0，peeled
+-> `687a119f0f`）；当前线的补丁、身份与证据以 `patches/transportd/series.yaml`、
++> 属于该基线。本线已由 `replay0905-v0159-r1` 取代，并再升基线至 rust-v0.159.2
++> （peeled `ff6aec96`；上一代基线为 rust-v0.159.0 / peeled `687a119f0f`）；当前线的补丁、身份与证据以 `patches/transportd/series.yaml`、
+ > `replay/manifest.yaml` 与 `PATCHES.md` 为准，本文件仅保留作逐 patch 溯源。
+ 
+ > 2026-09-06。本分支 `replay0905` 是 **review 视图**：把 codex transportd 的 133 个
+-- 
+2.48.1
+

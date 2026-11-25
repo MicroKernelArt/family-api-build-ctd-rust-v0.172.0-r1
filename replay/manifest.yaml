@@ -1,0 +1,132 @@
+schema: family-api/replay-line/v2
+line: replay1017-v0163-0
+repository: family-api-codex
+upstream_tag: rust-v0.163.0
+upstream_tag_object: 129b8ec7ee6f4511557a4856279f529025c25af4
+base_commit: 83086188ae0614bd882818ff1aa23f3194962012
+source_commit: 1702d2d1b9fecdd632042991b333596f56edeeee
+source_tree: 51d9287d59e4d606f1fd290809969cd797ebaaf0
+release_commit: 1702d2d1b9fecdd632042991b333596f56edeeee
+expected_release_tree: 51d9287d59e4d606f1fd290809969cd797ebaaf0
+commit_count: 37
+commits:
+  - commit: a84c4955b3d6ed44f362ef8a4ec16d9e6826165d
+    tree: 52563d52abbadb0257bb419851fcf8934a4b8e41
+    capability: transportd-crate-and-p1-planes
+  - commit: bb7a46bee6b44121e51e5ac4a51846326a912a8c
+    tree: 042d3012be8c767a4e8a744fc2face6e6c9fad0d
+    capability: codex-api-raw-endpoint-adapters
+  - commit: 8961fddbba305552000d66bb26dfc1afc5bf5b02
+    tree: dee871051e532120e0e07c0785e13c7336cb9c31
+    capability: http-client-raw-transport-and-explicit-route
+  - commit: 7b5baabbe958dfd3f7565418f8d807ae1764b33d
+    tree: d554156f984115f97a43c1ed87ea27935bcb2fb6
+    capability: websocket-client-explicit-route
+  - commit: a567d8e339ff43fc73d1cf07c4bec9cbcebd9ca9
+    tree: 6ff5828e3d23ec0fdb99d11b2c150dbb721f263d
+    capability: core-transport-metadata-adapter
+  - commit: 40ed92a0ed7e0de8fd209741dbe4768bd3faee6b
+    tree: f7f674e927f251b65badb83d6b378cb96e02508b
+    capability: codex-client-raw-retry-loop
+  - commit: ff5ce0d0a038e01a7bc24d1608d14a6095575d99
+    tree: 7b83acd5ec065993eea9bfd7eb5f9db257d20433
+    capability: login-auth-component-visibility
+  - commit: fe08fb9996e8bf01b82b9b38a2c3deb80677f38f
+    tree: 076252ca9959247cb2f53923e22a5ad17d6489cd
+    capability: ci-workflows-and-platform-archives
+  - commit: c32d9f931da6b508e604954c578b57f9b5bea746
+    tree: 22f060b2b5af7ab90538d181b999a7c2189ad1ff
+    capability: auxiliary-upstream-status-preservation
+  - commit: ae89b591f9b60a351d70eabb0f9598edef230d23
+    tree: 51392b10077130651b71fff2c308da5f6cc4caab
+    capability: operation-specific-default-deadlines
+  - commit: 82fc8009dc3ecda6297ea9feb104d7143c6d803a
+    tree: a43d876155dc6d51d23ed01c81cbba5446595e79
+    capability: upstream-operation-metadata-correction
+  - commit: 63366fb95c446311530717642f57285024888905
+    tree: 17426ebff7a93687b68875cf8a00e4eeb8ba5a56
+    capability: websocket-pong-channel-termination
+  - commit: 5a48ac72a9ac4f685f62ce2864507eb4a5bcc4e7
+    tree: f658ea9867e1dba68d7d02c451eed6068b564266
+    capability: shared-cloudflare-cookie-jar-documentation
+  - commit: bb3d541e3cef349a6c939a27ce9276c0106b2f2f
+    tree: 0a6f705c1dc2d0b0fd6aff80f3b58a406c080966
+    capability: disabled-raw-request-logging
+  - commit: 6d4480a18cdb14c0eb30ad4fd7d31743a68ef681
+    tree: 5f78614638cbfb07910627bfaa6aba555e6b3718
+    capability: bounded-pre-admission-uds-connections
+  - commit: bc2c4bab775517350ec3c2844450920c858e555f
+    tree: 6e265aca8eb5b365a18f38813d54a0a6de48bfad
+    capability: duplicate-upstream-header-preservation
+  - commit: f056820fc1ee41c5e502e30178bae70cfef3d32c
+    tree: c5380a2a28f3be4e1a42c34983b3c95fcbe93254
+    capability: release-evidence-machinery
+  - commit: bb5312b05ade6c0b647cecafb83babf01a75f994
+    tree: 86bb4b05493ec7f8f47070030213d7c9b99c2a06
+    capability: replay-export-binding-and-identity-consistency
+  - commit: 24f863ad061e951c0825495e7194f75aa06344e2
+    tree: 418227291dc7fbe787ccf8010436967a33778cb7
+    capability: carried-official-header-projection
+  - commit: 27cacfebabdd19994eea5573191dc72e34411ba3
+    tree: e6610710685e32b83ad66e273e2e71a36da42ddd
+    capability: carried-header-whitelist-parity
+  - commit: af5230a4a516fee27abcde276a7721667718493f
+    tree: c92b82c91b28b88467e7c0dfbd8bcff2cd4c9d4b
+    capability: client-request-id-carriage
+  - commit: 6aa57d9c77f7fe331a0d35929411273282e500d2
+    tree: 3057bc482358698276ae1cdde9c625d88dd73d61
+    capability: cargo-lock-local-version-normalization
+  - commit: 34cc8d25b44384e8c034010cd3611b34657f0ca1
+    tree: 7645b743a955bd2d320d0f030d538bcac89fb33c
+    capability: upstream-identity-repin-0159-2
+  - commit: e7b795259a8ec04905fb9ad83944faba4a69fc29
+    tree: 44ded40b9fad93fcce0cb99a5a94c5d83194b4f0
+    capability: replay-series-reexport-0159-2
+  - commit: fac03d05591316239a7814e6f0c4f96560861e17
+    tree: 7539b1b7040f357e29a2ae03089ec1be178f2dee
+    capability: hookpoint-switch-wiring-v1-default
+  - commit: 060ec6970b052fa10bed1db73bb586a1fed4b70f
+    tree: 72d9238c08c1ac99cfbe71a84ad87a15a30a3b7f
+    capability: hookpoint-v3-passthrough-contract
+  - commit: 9fb7c60f2915c319a6462f02f73b0f927ff53d3e
+    tree: d0ebacd48dcc8f4992a4bb1ec91cbc5a722ba5b6
+    capability: v1-outbound-wire-shape-alignment
+  - commit: 859c91e7e15d4a8e35539106fe23b0710e0a9cf3
+    tree: f5de9d9b2e2ff41890899dcab3b3b8fedfed13b4
+    capability: v3-outbound-wire-alignment-mislabeled
+  - commit: 429c6ca2546a84d6e77f0bed9cdc61d18b77d826
+    tree: f7716f7bf04b20f103cf8b7a986d3750dd0ce1a3
+    capability: v1-compact-wire-shape-alignment
+  - commit: 76c63c2cc016126ef25ee57f5b322510bda13b4c
+    tree: bc6cfb6b83c05c065370326cffa130fcd1633f7a
+    capability: v1-prompt-cache-key-session-binding
+  - commit: 76225cb4ee0207b8919ee897652252eab7743c0c
+    tree: 55c72177d8550d06222d59ceef0d9efc0ccd484e
+    capability: v3-compact-installation-id-carriage
+  - commit: ef3bdb60e48e3f3b8186228f3c188e1ae475c46a
+    tree: 52e3eb328f39d7e6ba02563a603759efdfcd0b63
+    capability: v3-compact-wire-header-sequence-pin
+  - commit: 747b62086052a180119409680a070872e7f09938
+    tree: ad9772d50db94c044a243c4111d0c3843832ea89
+    capability: replay-series-reexport-hookpoint
+  - commit: 735928903cf10b8d3207438ebac0523aee2aea5e
+    tree: 9808113096f7b27b4c4a40464ba03547cbad07f4
+    capability: installation-id-projection-identity
+  - commit: 2d52123dbe790ed604281f78a3482b8c533ca3fb
+    tree: 8a13297ebd822342279ad92c4b25dcd67b181505
+    capability: replay-series-reexport-installation-id
+  - commit: 2caf4663511c6755eb7bbce94909060ce137497e
+    tree: 30cde4c062bf691990aa2ee03a29ce0ecd8b5952
+    capability: runtime-configurable-body-limit
+  - commit: 1702d2d1b9fecdd632042991b333596f56edeeee
+    tree: 51d9287d59e4d606f1fd290809969cd797ebaaf0
+    capability: upstream-identity-repin-0163-0
+
+# 本清单覆盖 base_commit..source_commit 的**每一个**提交（含线内证据提交），
+# 否则 replay/gate.sh 的相邻性断言会失败。逐提交 (commit, tree) 由本证据提交
+# 从实际链生成；除证据路径外不存在 post-source 例外。
+# 本线由 rust-v0.159.2 线（replay0905）整线重放到 rust-v0.163.0 而来：
+# 36 个提交逐条 rebase，只有 2 个冲突（Cargo.lock 改为从上游官方锁重建；
+# responses_websocket.rs 的一个 import 块两侧新增类型全保留），随后补入
+# 一个 lock/identity 重钉提交，commit_count 34 -> 37。
+# capability 名称在重放中按提交标题顺序一一继承，未改名。

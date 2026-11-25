@@ -1,0 +1,27 @@
+# syntax=docker/dockerfile:1.7
+# 运行阶段镜像（build-sidecar.sh --local-cargo 路径专用）：
+# ELF 由脚本在容器内构建（docker run --network none --offline + 只读 source
+# + 独立 target），再由脚本复制进临时 context 打包本镜像。
+# 与多阶段 Dockerfile 运行阶段完全一致（digest 固定、10001:2000、
+# 显式 ENTRYPOINT）——避免在受限网络下重复编译。
+# R7-F7：apt 固定 Debian snapshot 日期（包版本可复现）。
+FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
+# R8-F6：APT 完全离线可复现——vendor .deb 闭包（deploy/vendor-debs.py 从
+# 固定 Debian snapshot 下载 + SHA256 校验）COPY 进镜像 dpkg -i 安装；
+# 运行镜像不再执行 apt-get update/install，无可变仓库解析。
+# curl/ca-certificates + 全部传递依赖版本与 SHA256 见 deploy/vendor-debs/manifest.sha256。
+COPY vendor-debs/ /debs/
+# R9-F9：安装前强制 sha256sum -c（manifest 与 vendor-debs.py 同源生成）；
+# 任何包缺失/损坏/新增未记录 → 镜像构建失败（fail closed）。
+# R10-F8：只安装 manifest 列出的文件（单事务 dpkg -i——逐个安装会因
+# 依赖顺序失败；*.deb 通配会装未记录包）。
+RUN cd /debs && sha256sum -c manifest.sha256 && \
+    dpkg -i $(awk '{print $2}' manifest.sha256) && \
+    rm -rf /debs
+RUN groupadd -g 2000 codex-transportd && useradd -u 10001 -g 2000 -M -s /usr/sbin/nologin codex-transportd
+WORKDIR /app
+COPY codex-transportd /app/codex-transportd
+RUN chmod 0755 /app/codex-transportd
+USER 10001:2000
+EXPOSE 8080
+ENTRYPOINT ["/app/codex-transportd"]

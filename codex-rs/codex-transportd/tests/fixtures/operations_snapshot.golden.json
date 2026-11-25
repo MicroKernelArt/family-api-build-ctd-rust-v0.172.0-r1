@@ -1,0 +1,143 @@
+{
+  "snapshot_version": 1,
+  "generator": "codex-transportd v0.170.0",
+  "operation_count": 17,
+  "operations": [
+    {
+      "operation": "agent_task_register",
+      "method": "POST",
+      "internal_path": "/_internal/v1/agent/task_register",
+      "upstream_path": "v1/agent/{agent_runtime_id}/task/register",
+      "requires_session": false,
+      "upgrade": false
+    },
+    {
+      "operation": "alpha_search",
+      "method": "POST",
+      "internal_path": "/_internal/v1/alpha/search",
+      "upstream_path": "alpha/search",
+      "requires_session": false,
+      "upgrade": false
+    },
+    {
+      "operation": "oauth_refresh",
+      "method": "POST",
+      "internal_path": "/_internal/v1/auth/oauth_refresh",
+      "upstream_path": "token",
+      "requires_session": false,
+      "upgrade": false
+    },
+    {
+      "operation": "oauth_whoami",
+      "method": "GET",
+      "internal_path": "/_internal/v1/auth/whoami",
+      "upstream_path": "api/accounts/v1/user-auth-credential/whoami",
+      "requires_session": false,
+      "upgrade": false
+    },
+    {
+      "operation": "attachment_download",
+      "method": "GET",
+      "internal_path": "/_internal/v1/files/attachment",
+      "upstream_path": "conversation/{conversation_id}/attachment/{attachment_id}/download",
+      "requires_session": false,
+      "upgrade": false
+    },
+    {
+      "operation": "file_content_fetch",
+      "method": "GET",
+      "internal_path": "/_internal/v1/files/content",
+      "upstream_path": "",
+      "requires_session": false,
+      "upgrade": false
+    },
+    {
+      "operation": "file_download",
+      "method": "GET",
+      "internal_path": "/_internal/v1/files/download",
+      "upstream_path": "files/{file_id}/download",
+      "requires_session": false,
+      "upgrade": false
+    },
+    {
+      "operation": "file_upload",
+      "method": "POST",
+      "internal_path": "/_internal/v1/files/upload",
+      "upstream_path": "files",
+      "requires_session": false,
+      "upgrade": false
+    },
+    {
+      "operation": "models",
+      "method": "GET",
+      "internal_path": "/_internal/v1/models",
+      "upstream_path": "models",
+      "requires_session": false,
+      "upgrade": false
+    },
+    {
+      "operation": "quota_consume",
+      "method": "POST",
+      "internal_path": "/_internal/v1/quota/consume",
+      "upstream_path": "wham/rate-limit-reset-credits/consume",
+      "requires_session": false,
+      "upgrade": false
+    },
+    {
+      "operation": "quota_credits",
+      "method": "GET",
+      "internal_path": "/_internal/v1/quota/credits",
+      "upstream_path": "wham/rate-limit-reset-credits",
+      "requires_session": false,
+      "upgrade": false
+    },
+    {
+      "operation": "realtime_call",
+      "method": "POST",
+      "internal_path": "/_internal/v1/realtime/calls",
+      "upstream_path": "realtime/calls",
+      "requires_session": false,
+      "upgrade": false
+    },
+    {
+      "operation": "realtime_sideband",
+      "method": "GET",
+      "internal_path": "/_internal/v1/realtime/sideband",
+      "upstream_path": "realtime/calls/sideband",
+      "requires_session": false,
+      "upgrade": true
+    },
+    {
+      "operation": "responses",
+      "method": "POST",
+      "internal_path": "/_internal/v1/responses",
+      "upstream_path": "responses",
+      "requires_session": true,
+      "upgrade": false
+    },
+    {
+      "operation": "responses_compact",
+      "method": "POST",
+      "internal_path": "/_internal/v1/responses/compact",
+      "upstream_path": "responses/compact",
+      "requires_session": true,
+      "upgrade": false
+    },
+    {
+      "operation": "responses_ws_v2",
+      "method": "GET",
+      "internal_path": "/_internal/v1/responses/ws",
+      "upstream_path": "responses",
+      "requires_session": true,
+      "upgrade": true
+    },
+    {
+      "operation": "usage",
+      "method": "GET",
+      "internal_path": "/_internal/v1/usage",
+      "upstream_path": "wham/usage",
+      "requires_session": false,
+      "upgrade": false
+    }
+  ]
+}

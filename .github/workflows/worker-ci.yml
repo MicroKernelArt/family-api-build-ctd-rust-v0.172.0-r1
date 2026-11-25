@@ -1,0 +1,175 @@
+name: worker-ci
+
+on:
+  push:
+    branches: ["ci/family-api-codex/**"]
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Full candidate commit SHA
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: worker-ci-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "2"
+  # R3-LINK-001: ld died with signal 7 [Bus error] at the final lib-test
+  # link on runs 33472913683 and 33498330072 — identical bounded stage,
+  # zero product changes between them (hosted linker/runner resource
+  # failure). Run 33502997032 then failed with 'No space left on device
+  # (os error 28)' writing target/release artifacts to the small root
+  # disk — the same resource-exhaustion family with exact evidence.
+  # CI-only mitigation: strip dev/test debuginfo (less to link) and keep
+  # the cargo target dir on /mnt (the large runner disk). Release profile
+  # and the receipt-bound `cargo build --release` are unaffected.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_TARGET_DIR: /mnt/ci-target
+
+jobs:
+  identity:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Bind run to candidate identity
+        env:
+          DISPATCH_SHA: ${{ inputs.expected_sha }}
+        run: |
+          set -euo pipefail
+          HEAD=$(git rev-parse HEAD)
+          TREE=$(git rev-parse 'HEAD^{tree}')
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            case "${GITHUB_REF_NAME}" in
+              ci/family-api-codex/*/${GITHUB_SHA}) ;;
+              *) echo "FAIL: CI ref is not task/SHA bound: ${GITHUB_REF_NAME}" >&2; exit 1 ;;
+            esac
+            EXPECTED_SHA=${GITHUB_REF_NAME##*/}
+          else
+            EXPECTED_SHA=${DISPATCH_SHA}
+          fi
+          [ "${HEAD}" = "${GITHUB_SHA}" ]
+          [ "${HEAD}" = "${EXPECTED_SHA}" ]
+          echo "CWF_CI_IDENTITY repo=${GITHUB_REPOSITORY} head=${HEAD} tree=${TREE} branch=${GITHUB_REF_NAME}"
+
+  transportd:
+    needs: identity
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Bound linker memory (R3-LINK-001 repeated ld SIGBUS evidence)
+        run: |
+          set -euo pipefail
+          sudo swapoff -a || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 6G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          sudo mkdir -p /mnt/ci-target
+          sudo chown -R "$(id -un):$(id -gn)" /mnt/ci-target
+          df -h / /mnt
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
+        with:
+          toolchain: 1.95.0
+          components: clippy,rustfmt,rust-src
+      - name: Locked transportd build, tests, and lint
+        working-directory: codex-rs
+        run: |
+          set -euo pipefail
+          cargo build --locked -p codex-transportd --release
+          rm -rf "${CARGO_TARGET_DIR}/release"
+          cargo test --locked -p codex-transportd
+          cargo test --locked -p codex-transportd --features test-upstream
+          cargo test --locked -p codex-client --test retry_raw_tests
+          cargo test --locked -p codex-http-client --lib
+          cargo clippy --locked -p codex-transportd --no-deps -- -D warnings
+
+  replay-gates:
+    needs: identity
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Bound linker memory (R3-LINK-001 repeated ld SIGBUS evidence)
+        run: |
+          set -euo pipefail
+          sudo swapoff -a || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 6G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          sudo mkdir -p /mnt/ci-target
+          sudo chown -R "$(id -un):$(id -gn)" /mnt/ci-target
+          df -h / /mnt
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
+        with:
+          toolchain: 1.95.0
+      - name: Verify replay, export, evidence, and mutation gates
+        run: |
+          set -euo pipefail
+          RECEIPT="${RUNNER_TEMP}/transportd-source-receipt.txt"
+          bash patches/transportd/tools/write-source-receipt.sh "$RECEIPT"
+          bash replay/worker-ci-static-test.sh
+          bash replay/gate.sh
+          bash patches/transportd/tools/export-gate.sh
+          bash patches/transportd/tools/release-evidence-gate.sh --receipt "$RECEIPT"
+          bash patches/transportd/tools/ci-gates-static-test.sh
+          bash patches/transportd/tools/static-fix-gates.sh
+          bash patches/transportd/tools/capture-isolation-gate.sh
+          bash patches/transportd/tools/gate-mutation-test.sh
+          bash patches/transportd/tools/gate-export-mutation-test.sh
+          bash patches/transportd/tools/gate-evidence-mutation-test.sh
+          bash patches/transportd/tools/gate-wire-sbom-mutation-test.sh
+
+  platform-policy:
+    needs: identity
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Verify supported archive policy
+        shell: bash
+        run: bash codex-rs/scripts/check-platform-archives.sh
+
+  results:
+    if: always()
+    needs: [identity, transportd, replay-gates, platform-policy]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every worker CI job
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          needs = json.loads(os.environ["NEEDS"])
+          failed = {name: item["result"] for name, item in needs.items() if item["result"] != "success"}
+          if failed:
+              print(f"FAIL: worker CI jobs: {failed}", file=sys.stderr)
+              raise SystemExit(1)
+          print("PASS: all worker CI jobs succeeded")
+          PY

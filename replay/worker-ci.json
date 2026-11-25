@@ -1,0 +1,7 @@
+{
+  "schema": "cwf/worker-github-ci-config/v1",
+  "project": "family-api-codex",
+  "repo": "MicroKernelArt/family-api-codex",
+  "required_workflows": ["worker-ci.yml"],
+  "max_fix_rounds": 3
+}
