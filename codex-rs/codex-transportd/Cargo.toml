@@ -58,4 +58,4 @@ uuid = { workspace = true }
 zstd = { workspace = true }
 
 [build-dependencies]
-sha2 = "0.10"
+sha2 = "0.11"
