@@ -293,13 +293,7 @@ UPSTREAM_COMMIT_EXPECT="$(sed -n 's/^peeled_base_commit: //p' "$REPO/patches/tra
 for v in "$UPSTREAM_TAG_EXPECT" "$UPSTREAM_COMMIT_EXPECT"; do
   [ -n "$v" ] || { echo "FAIL: series.yaml 缺少 upstream_tag / peeled_base_commit"; exit 1; }
 done
-UPSTREAM_LOCK_EXPECT="$(sed -n 's/^upstream_cargo_lock_sha256: //p' "$REPO/patches/transportd/series.yaml" | tr -d ' ')"
-if [ -z "$UPSTREAM_LOCK_EXPECT" ]; then
-  # Fallback for the disposable CI export: the synthetic source repo does not
-  # carry the upstream tag's git objects. This is the immutable rust-v0.172.0
-  # codex-rs/Cargo.lock SHA-256.
-  UPSTREAM_LOCK_EXPECT="42a8f334ee469aeeb6fccda4bd468f5addbe6d4e564e2780a90473090112c5ab"
-fi
+UPSTREAM_LOCK_EXPECT="$(git -C "$SRC" show "$UPSTREAM_COMMIT_EXPECT:codex-rs/Cargo.lock" | shasum -a 256 | awk '{print $1}')"
 [ -n "$UPSTREAM_LOCK_EXPECT" ] || { echo "FAIL: 无法读取上游基线的 codex-rs/Cargo.lock"; exit 1; }
 
 # D.4：/info 的三项此前无断言，但都会被本次身份变更直接改变——期望值一律

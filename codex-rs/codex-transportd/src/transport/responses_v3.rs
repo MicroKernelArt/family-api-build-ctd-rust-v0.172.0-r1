@@ -1263,13 +1263,12 @@ mod tests {
                 "chatgpt-account-id".to_string(),
                 "originator".to_string(),
                 "user-agent".to_string(),
-                "accept-encoding".to_string(),
                 "host".to_string(),
                 "content-length".to_string(),
             ],
             "v3 compact 出站头序必须为「version → installation → 官方元数据序 → \
-             accept → content-type → auth → originator → user-agent → \
-             accept-encoding → host → content-length」\n{head}"
+             accept → content-type → auth → originator → user-agent → host → \
+             content-length」\n{head}"
         );
         assert_eq!(
             header_value(&head, "x-codex-installation-id"),

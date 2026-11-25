@@ -8,22 +8,22 @@
 /// 构建流水线可覆盖为正式 ID，缺省为 dev）。
 pub const RELEASE_ID: &str = match option_env!("CODEX_TRANSPORTD_RELEASE_ID") {
     Some(value) => value,
-    None => "ctd-rust-v0.172.0-dev",
+    None => "ctd-rust-v0.170.0-dev",
 };
 
 /// Upstream tag（官方 exact-tag fork 基准）。
-pub const UPSTREAM_TAG: &str = "rust-v0.172.0";
+pub const UPSTREAM_TAG: &str = "rust-v0.170.0";
 
-/// Upstream peeled commit（`git ls-remote refs/tags/rust-v0.172.0^{}`）。
-/// fc3036db 是 annotated tag 对象；peeled source commit 才是 3d86e43b……
-pub const UPSTREAM_COMMIT: &str = "3d86e43b075adeba2193ec5c22ac92f55afd82e6";
+/// Upstream peeled commit（`git ls-remote refs/tags/rust-v0.170.0^{}`）。
+/// 72f97c30 是 annotated tag 对象；peeled source commit 才是 29eb79e9……
+pub const UPSTREAM_COMMIT: &str = "29eb79e9866b3262a777fdf8195c1b9e63684c91";
 
 /// Upstream `codex-rs/Cargo.lock` SHA-256（fork 之前官方锁文件）。
 pub const UPSTREAM_LOCK_SHA256: &str =
-    "42a8f334ee469aeeb6fccda4bd468f5addbe6d4e564e2780a90473090112c5ab";
+    "3bd770fcba9f1cb9c998bf496c5c9f3bca7908fc9d462d8c4b3a9fd805f49202";
 
 /// Rust toolchain（`codex-rs/rust-toolchain.toml`）。
-pub const TOOLCHAIN: &str = "1.99.1";
+pub const TOOLCHAIN: &str = "1.95.0";
 
 /// 实际运行镜像 base（R8-F4：与 Dockerfile 运行阶段一致——debian
 /// trixie-slim，digest 固定；不再报告官方上游的 Ubuntu 引用）。
