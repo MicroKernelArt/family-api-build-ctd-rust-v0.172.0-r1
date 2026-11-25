@@ -1,0 +1,64 @@
+name: build-codex-transportd-01720
+
+# Disposable build workflow for the 0.172.0 sidecar release.
+# It runs the checked-in release build entrypoint on a native linux/amd64 runner.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+concurrency:
+  group: build-sidecar-01720
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      RELEASE_ID: ctd-rust-v0.172.0-r1
+      BUILD_PROFILE: release
+      PLATFORM: linux/amd64
+      CTD_RELEASE_RECEIPT_PATH: /tmp/ctd-release-receipt.txt
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare pinned images and v8 closure
+        env:
+          CTD_V8_CACHE: ${{ runner.temp }}/v8-cache
+          CTD_RELEASE_RECEIPT_PATH: /tmp/ctd-release-receipt.txt
+        run: |
+          set -euxo pipefail
+          git rev-parse --verify "$(sed -n 's/^source_commit: //p' patches/transportd/series.yaml)" >/dev/null
+          deploy/build-sidecar.sh prepare
+
+      - name: Build offline release image
+        env:
+          CTD_V8_CACHE: ${{ runner.temp }}/v8-cache
+          CTD_RELEASE_RECEIPT_PATH: /tmp/ctd-release-receipt.txt
+        run: |
+          set -euxo pipefail
+          deploy/build-sidecar.sh build --mode local-cargo
+
+      - name: Save image and receipt
+        run: |
+          set -euo pipefail
+          docker save weishaw/codex-transportd:build | gzip > "$RUNNER_TEMP/codex-transportd-${RELEASE_ID}.tar.gz"
+          sha256sum "$RUNNER_TEMP/codex-transportd-${RELEASE_ID}.tar.gz" > "$RUNNER_TEMP/artifact.sha256"
+          cp "$CTD_RELEASE_RECEIPT_PATH" "$RUNNER_TEMP/ctd-release-receipt.txt"
+          docker image inspect weishaw/codex-transportd:build --format '{{.Id}}' > "$RUNNER_TEMP/image-digest.txt"
+          ls -lh "$RUNNER_TEMP"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-transportd-${{ env.RELEASE_ID }}-amd64
+          path: |
+            ${{ runner.temp }}/codex-transportd-*.tar.gz
+            ${{ runner.temp }}/artifact.sha256
+            ${{ runner.temp }}/ctd-release-receipt.txt
+            ${{ runner.temp }}/image-digest.txt
+          retention-days: 7
