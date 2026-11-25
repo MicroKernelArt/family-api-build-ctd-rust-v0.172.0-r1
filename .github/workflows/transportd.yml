@@ -33,7 +33,7 @@ jobs:
         run: |
           shasum -a 256 codex-rs/target/release/codex-transportd
           shasum -a 256 codex-rs/target/release/codex-transportd > build-proof-digest.txt
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: codex-transportd-release
           path: |
